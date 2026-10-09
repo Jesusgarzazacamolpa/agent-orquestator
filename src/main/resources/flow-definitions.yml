@@ -1,0 +1,30 @@
+orchestrator:
+  flows:
+    compra-vehiculo:
+      process-template-name: "Compra de vehiculo"
+      system-prompt-template: prompts/compra-vehiculo-system.st
+      user-prompt-template: prompts/compra-vehiculo-user.st
+      tools:
+        - name: get_vehicle_information
+          server: mcp-domain
+          step-order: 1
+          step-name: consultar_vehiculo
+          required: true
+        - name: register_vehicle_purchase
+          server: mcp-domain
+          step-order: 2
+          step-name: registrar_compra
+          required: true
+          depends-on: [get_vehicle_information]
+        - name: set_payment_method
+          server: mcp-domain
+          step-order: 3
+          step-name: configurar_pago
+          required: true
+          depends-on: [register_vehicle_purchase]
+        - name: send_purchase_status_email
+          server: mcp-notifications
+          step-order: 4
+          step-name: enviar_correo
+          required: true
+          depends-on: [set_payment_method]

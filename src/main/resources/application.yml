@@ -24,7 +24,7 @@ services:
 
 ollama:
   base-url: http://localhost:11434
-  model: llama3.2:1b
+  model: qwen2.5:7b
   max-agent-turns: 8
 
 orchestrator:

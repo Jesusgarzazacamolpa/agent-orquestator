@@ -26,6 +26,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class FlowService {
@@ -164,22 +166,37 @@ public class FlowService {
         String currentStep = null;
 
         try {
+            log.info("[info] Entering agent loop: flowId={}, executionId={}, maxAgentTurns={}",
+                    flowId, executionId, maxAgentTurns);
             List<Map<String, Object>> availableTools;
             for (int turn = 0; turn < maxAgentTurns; turn++) {
-            availableTools = getToolDefinitions(flow, completedTools, discoveredByServer);
-                log.debug("[AGENT] Requesting decision: flowId={}, executionId={}, turn={}/{}",
+                log.info("[info] Turn {} starting: flowId={}, executionId={}", turn + 1, flowId, executionId);
+                log.info("[info] Calling getToolDefinitions: flowId={}, executionId={}, completedTools={}",
+                        flowId, executionId, completedTools);
+                availableTools = getToolDefinitions(flow, completedTools, discoveredByServer);
+                log.info("[info] getToolDefinitions returned {} tools: flowId={}, executionId={}, tools={}",
+                        availableTools.size(), flowId, executionId,
+                        availableTools.stream().map(t -> String.valueOf(((Map<?, ?>) t.get("function")).get("name"))).toList());
+                log.info("[AGENT] Requesting decision: flowId={}, executionId={}, turn={}/{}",
                         flowId, executionId, turn + 1, maxAgentTurns);
+                log.info("[info] Calling Ollama: flowId={}, executionId={}, ollamaBaseUrl={}, model={}",
+                        flowId, executionId, ollamaBaseUrl, ollamaModel);
+                Map<String, Object> ollamaRequest = new HashMap<>();
+                ollamaRequest.put("model", ollamaModel);
+                ollamaRequest.put("messages", messages);
+                ollamaRequest.put("tools", availableTools);
+                ollamaRequest.put("stream", false);
+                ollamaRequest.put("tool_choice", "required");
+                ollamaRequest.put("options", Map.of("temperature", 0.0, "top_p", 0.1));
                 Map<String, Object> ollamaResponse = webClient.post()
                         .uri(ollamaBaseUrl + "/api/chat")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .bodyValue(Map.of(
-                                "model", ollamaModel,
-                                "messages", messages,
-                                "tools", availableTools,
-                                "stream", false))
+                        .bodyValue(ollamaRequest)
                         .retrieve()
                         .bodyToMono(Map.class)
                         .block();
+                log.info("[info] Ollama response received: flowId={}, executionId={}, response={}",
+                        flowId, executionId, ollamaResponse);
                 Map<String, Object> assistantMessage = asMap(ollamaResponse == null ? null : ollamaResponse.get("message"));
                 if (assistantMessage.isEmpty()) {
                     throw new IllegalStateException("Ollama returned an empty assistant message");
@@ -188,12 +205,29 @@ public class FlowService {
 
                 List<?> toolCalls = assistantMessage.get("tool_calls") instanceof List<?> calls ? calls : List.of();
                 if (toolCalls.isEmpty()) {
+                    // Intentar parsear tool calls embebidas como texto en content
+                    String content = String.valueOf(assistantMessage.getOrDefault("content", ""));
+                    List<Map<String, Object>> parsedToolCalls = parseToolCallsFromContent(content, flow, flowId, executionId);
+                    if (!parsedToolCalls.isEmpty()) {
+                        log.info("[PARSE] Tool calls parsed from content: flowId={}, executionId={}, toolCalls={}",
+                                flowId, executionId, parsedToolCalls);
+                        toolCalls = parsedToolCalls;
+                    } else {
+                        log.warn("[NO_TOOLS] Ollama response without tool_calls and no parseable content: flowId={}, executionId={}, content={}",
+                                flowId, executionId, content);
+                    }
+                } else {
+                    log.info("[TOOLS] Ollama returned tool_calls directly: flowId={}, executionId={}, toolCalls={}",
+                            flowId, executionId, toolCalls);
+                }
+                if (toolCalls.isEmpty()) {
                     Set<String> requiredTools = getRequiredTools(flow);
                     if (!completedTools.containsAll(requiredTools)) {
                         throw new IllegalStateException("Agent finished before completing all required tools: " +
                                 difference(requiredTools, completedTools));
                     }
                     updateExecutionStatus(executionId, "COMPLETED", null, null);
+                    log.info("[DONE] Flow update status completed: flowId={}, executionId={}", flowId, executionId);
                     response.setStatus("COMPLETED");
                     response.setMessage(String.valueOf(assistantMessage.getOrDefault("content", "")));
                     log.info("[DONE] Flow completed: flowId={}, executionId={}", flowId, executionId);
@@ -204,6 +238,8 @@ public class FlowService {
                     Map<String, Object> toolCall = asMap(rawToolCall);
                     Map<String, Object> function = asMap(toolCall.get("function"));
                     String toolName = String.valueOf(function.get("name"));
+                    log.info("[info] Processing tool call: flowId={}, executionId={}, toolName={}",
+                            flowId, executionId, toolName);
                     ToolDefinition tool;
                     try {
                         tool = findTool(flow, toolName);
@@ -252,8 +288,8 @@ public class FlowService {
             throw new IllegalStateException("Agent exceeded the maximum number of turns");
         } catch (RuntimeException ex) {
             String errorMessage = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
-            log.error("[FAIL] Flow failed: flowId={}, executionId={}, step={}, errorType={}",
-                    flowId, executionId, currentStep, ex.getClass().getSimpleName());
+            log.error("[FAIL] Flow failed: flowId={}, executionId={}, step={}, errorType={}, message={}",
+                    flowId, executionId, currentStep, ex.getClass().getSimpleName(), errorMessage);
             try {
                 if (currentStepOrder > 0) {
                     updateStepStatus(executionId, currentStepOrder, "FAILED", errorMessage);
@@ -384,6 +420,64 @@ public class FlowService {
         Set<String> missing = new HashSet<>(required);
         missing.removeAll(completed);
         return missing;
+    }
+
+    /**
+     * Intenta parsear tool calls embebidas como texto JSON en el content del mensaje.
+     * Algunos modelos de Ollama devuelven los tool calls como texto en lugar de usar la estructura correcta.
+     *
+     * @param content Texto del mensaje del asistente.
+     * @param flow    Definición del flujo actual.
+     * @return Lista de tool calls parseadas, o lista vacía si no se encontraron.
+     */
+    private List<Map<String, Object>> parseToolCallsFromContent(String content, FlowDefinition flow, String flowId, String executionId) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        if (content == null || content.isBlank()) {
+            return result;
+        }
+
+        log.debug("[PARSE] Attempting to parse tool calls from content: flowId={}, content={}", flowId, content);
+
+        // Buscar todos los fragmentos que parezcan objetos JSON con "name"
+        // Usamos un patrón que busque objetos JSON que contengan "name" y "parameters" o "arguments"
+        Pattern pattern = Pattern.compile("\\{[^{}]*\"name\"\\s*:\\s*\"[^\"]+\"[^{}]*\\}");
+        Matcher matcher = pattern.matcher(content);
+        int foundCount = 0;
+        while (matcher.find()) {
+            String jsonFragment = matcher.group();
+            log.debug("[PARSE] Found JSON fragment: {}", jsonFragment);
+            try {
+                Map<String, Object> parsed = objectMapper.readValue(jsonFragment, Map.class);
+                if (parsed.containsKey("name") && (parsed.containsKey("parameters") || parsed.containsKey("arguments"))) {
+                    String toolName = String.valueOf(parsed.get("name"));
+                    // Verificar que la herramienta esté permitida en el flujo
+                    boolean allowed = flow.getTools().stream()
+                            .anyMatch(t -> t.getName().equals(toolName));
+                    if (!allowed) {
+                        log.warn("[PARSE] Tool call parsed but not allowed in flow: tool={}, allowed={}",
+                                toolName, flow.getTools().stream().map(ToolDefinition::getName).toList());
+                        continue;
+                    }
+                    Map<String, Object> arguments = (Map<String, Object>) parsed.getOrDefault("parameters",
+                            parsed.getOrDefault("arguments", Map.of()));
+                    Map<String, Object> toolCall = new HashMap<>();
+                    toolCall.put("id", "call_" + System.nanoTime());
+                    Map<String, Object> function = new HashMap<>();
+                    function.put("name", toolName);
+                    function.put("arguments", arguments);
+                    toolCall.put("function", function);
+                    result.add(toolCall);
+                    foundCount++;
+                    log.info("[PARSE] Tool call parsed from content: tool={}, arguments={}", toolName, arguments);
+                } else {
+                    log.debug("[PARSE] Fragment does not contain name+parameters/arguments: {}", jsonFragment);
+                }
+            } catch (JsonProcessingException ex) {
+                log.warn("[PARSE] Failed to parse JSON fragment: {}, error={}", jsonFragment, ex.getMessage());
+            }
+        }
+        log.info("[PARSE] Parsing complete: found={} valid tool calls", foundCount);
+        return result;
     }
 
     private String renderPrompt(String templatePath, Map<String, Object> attributes) {

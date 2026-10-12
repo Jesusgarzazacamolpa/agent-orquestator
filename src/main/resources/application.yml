@@ -11,6 +11,8 @@ spring:
     name: orchestrator
 
 logging:
+  charset:
+    console: UTF-8
   pattern:
     console: "%clr(%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX}){faint} %clr(%-5level){level} %clr([%thread]){faint} %clr(%logger{36}){cyan} - %clr(%msg){level}%n%ex"
 

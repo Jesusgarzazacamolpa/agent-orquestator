@@ -5,11 +5,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.floworchestrator.orchestrator.config.FlowDefinitions;
 import com.floworchestrator.orchestrator.config.FlowDefinitions.FlowDefinition;
 import com.floworchestrator.orchestrator.config.FlowDefinitions.ToolDefinition;
+import com.floworchestrator.orchestrator.model.FlowExecutionEvent;
 import com.floworchestrator.orchestrator.model.FlowRequest;
 import com.floworchestrator.orchestrator.model.FlowResponse;
+import com.floworchestrator.orchestrator.model.FlowStepExecution;
 import com.floworchestrator.orchestrator.service.McpToolClient.DiscoveredTool;
 import org.stringtemplate.v4.ST;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
@@ -41,6 +44,7 @@ public class FlowService {
     private final ObjectMapper objectMapper;
     private final FlowDefinitions flowDefinitions;
     private final McpToolClient mcpClientRegistry;
+    private final FlowEventPublisher flowEventPublisher;
 
     /**
      * Constructor que inicializa el servicio de orquestación de flujos.
@@ -51,16 +55,18 @@ public class FlowService {
      * @param ollamaModel           Modelo de IA a utilizar (ej. llama3.1).
      * @param maxAgentTurns         Número máximo de turnos que puede tomar el agente.
      * @param objectMapper          Objeto para serialización/deserialización JSON.
+     * @param flowEventPublisher    Publicador de eventos SSE para trazabilidad.
      */
     public FlowService(
             WebClient.Builder webClientBuilder,
-            @Value("${services.control-center.base-url:http://localhost:8081}") String controlCenterBaseUrl,
-            @Value("${ollama.base-url:http://localhost:11434}") String ollamaBaseUrl,
-            @Value("${ollama.model:llama3.1}") String ollamaModel,
-            @Value("${ollama.max-agent-turns:8}") int maxAgentTurns,
+            @Value("${services.control-center.base-url}") String controlCenterBaseUrl,
+            @Value("${ollama.base-url}") String ollamaBaseUrl,
+            @Value("${ollama.model}") String ollamaModel,
+            @Value("${ollama.max-agent-turns}") int maxAgentTurns,
             ObjectMapper objectMapper,
             FlowDefinitions flowDefinitions,
-            McpToolClient mcpClientRegistry
+            McpToolClient mcpClientRegistry,
+            FlowEventPublisher flowEventPublisher
     ) {
         this.webClient = webClientBuilder.build();
         this.controlCenterBaseUrl = controlCenterBaseUrl;
@@ -70,6 +76,7 @@ public class FlowService {
         this.objectMapper = objectMapper;
         this.flowDefinitions = flowDefinitions;
         this.mcpClientRegistry = mcpClientRegistry;
+        this.flowEventPublisher = flowEventPublisher;
     }
 
     /**
@@ -105,36 +112,41 @@ public class FlowService {
         validateFlow(flow);
         log.info("[START] Starting flow: flowId={}", flowId);
 
-        Map<String, Object> templateResponse = webClient.get()
-                .uri(UriComponentsBuilder.fromUriString(controlCenterBaseUrl + "/api/process-templates/by-name")
-                        .queryParam("name", flow.getProcessTemplateName())
-                        .build()
-                        .encode()
-                        .toUri())
-                .retrieve()
-                .bodyToMono(Map.class)
-                .block();
-        if (templateResponse == null || templateResponse.get("id") == null) {
-            throw new IllegalStateException("Control Center did not return an active process template ID");
+        String executionId = request.getExecutionId();
+        if (executionId == null || executionId.isBlank()) {
+            Map<String, Object> templateResponse = webClient.get()
+                    .uri(UriComponentsBuilder.fromUriString(controlCenterBaseUrl + "/api/process-templates/by-name")
+                            .queryParam("name", flow.getProcessTemplateName())
+                            .build()
+                            .encode()
+                            .toUri())
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+            if (templateResponse == null || templateResponse.get("id") == null) {
+                throw new IllegalStateException("Control Center did not return an active process template ID");
+            }
+
+            Map<String, Object> controlCenterRequest = new HashMap<>();
+            controlCenterRequest.put("processTemplateId", templateResponse.get("id"));
+            controlCenterRequest.put("customerId", request.getCustomerId());
+
+            Map<String, Object> controlCenterResponse = webClient.post()
+                    .uri(controlCenterBaseUrl + "/api/processes")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue(controlCenterRequest)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+            if (controlCenterResponse == null || controlCenterResponse.get("id") == null) {
+                throw new IllegalStateException("Control Center did not return a process execution ID");
+            }
+            executionId = controlCenterResponse.get("id").toString();
         }
-
-        Map<String, Object> controlCenterRequest = new HashMap<>();
-        controlCenterRequest.put("processTemplateId", templateResponse.get("id"));
-        controlCenterRequest.put("customerId", request.getCustomerId());
-
-        Map<String, Object> controlCenterResponse = webClient.post()
-                .uri(controlCenterBaseUrl + "/api/processes")
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(controlCenterRequest)
-                .retrieve()
-                .bodyToMono(Map.class)
-                .block();
-        if (controlCenterResponse == null || controlCenterResponse.get("id") == null) {
-            throw new IllegalStateException("Control Center did not return a process execution ID");
-        }
-
-        String executionId = controlCenterResponse.get("id").toString();
         log.info("[ID] Process execution created: flowId={}, executionId={}", flowId, executionId);
+        flowEventPublisher.publish(new FlowExecutionEvent(
+                executionId, flowId, "FLOW_STARTED", null, null, null, null, "IN_PROGRESS", null,
+                java.time.OffsetDateTime.now()));
         FlowResponse response = new FlowResponse();
         response.setId(executionId);
         response.setCustomerId(request.getCustomerId());
@@ -226,8 +238,10 @@ public class FlowService {
                         throw new IllegalStateException("Agent finished before completing all required tools: " +
                                 difference(requiredTools, completedTools));
                     }
-                    updateExecutionStatus(executionId, "COMPLETED", null, null);
                     log.info("[DONE] Flow update status completed: flowId={}, executionId={}", flowId, executionId);
+                    flowEventPublisher.publish(new FlowExecutionEvent(
+                            executionId, flowId, "FLOW_COMPLETED", null, null, null, null,
+                            "COMPLETED", null, java.time.OffsetDateTime.now()));
                     response.setStatus("COMPLETED");
                     response.setMessage(String.valueOf(assistantMessage.getOrDefault("content", "")));
                     log.info("[DONE] Flow completed: flowId={}, executionId={}", flowId, executionId);
@@ -265,12 +279,24 @@ public class FlowService {
                         currentStep = tool.getStepName();
                         log.info("[CALL] Agent requested MCP tool: flowId={}, executionId={}, server={}, tool={}, step={}",
                                 flowId, executionId, tool.getServer(), toolName, currentStep);
-                        updateStepStatus(executionId, currentStepOrder, "RUNNING", null);
+                        flowEventPublisher.publish(new FlowExecutionEvent(
+                                executionId, flowId, "STEP_STARTED", currentStepOrder, currentStep,
+                                toolName, tool.getServer(), "RUNNING", null, java.time.OffsetDateTime.now()));
                         long toolStartedAt = System.nanoTime();
-                        Map<String, Object> result = executeTool(tool, arguments);
-                        toolResults.put(toolName, result);
-                        completedTools.add(toolName);
-                        updateStepStatus(executionId, currentStepOrder, "COMPLETED", null);
+                        try {
+                            Map<String, Object> result = executeTool(tool, arguments);
+                            toolResults.put(toolName, result);
+                            completedTools.add(toolName);
+                            flowEventPublisher.publish(new FlowExecutionEvent(
+                                    executionId, flowId, "STEP_COMPLETED", currentStepOrder, currentStep,
+                                    toolName, tool.getServer(), "COMPLETED", null, java.time.OffsetDateTime.now()));
+                        } catch (RuntimeException ex) {
+                            String toolError = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+                            flowEventPublisher.publish(new FlowExecutionEvent(
+                                    executionId, flowId, "STEP_FAILED", currentStepOrder, currentStep,
+                                    toolName, tool.getServer(), "FAILED", toolError, java.time.OffsetDateTime.now()));
+                            throw ex;
+                        }
                         log.info("[OK] MCP tool completed: flowId={}, executionId={}, tool={}, durationMs={}",
                                 flowId, executionId, toolName,
                                 (System.nanoTime() - toolStartedAt) / 1_000_000);
@@ -290,15 +316,9 @@ public class FlowService {
             String errorMessage = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
             log.error("[FAIL] Flow failed: flowId={}, executionId={}, step={}, errorType={}, message={}",
                     flowId, executionId, currentStep, ex.getClass().getSimpleName(), errorMessage);
-            try {
-                if (currentStepOrder > 0) {
-                    updateStepStatus(executionId, currentStepOrder, "FAILED", errorMessage);
-                } else {
-                    updateExecutionStatus(executionId, "FAILED", currentStep, errorMessage);
-                }
-            } catch (RuntimeException statusUpdateException) {
-                ex.addSuppressed(statusUpdateException);
-            }
+            flowEventPublisher.publish(new FlowExecutionEvent(
+                    executionId, flowId, "FLOW_FAILED", currentStepOrder, currentStep,
+                    null, null, "FAILED", errorMessage, java.time.OffsetDateTime.now()));
             response.setStatus("FAILED");
             response.setCurrentStep(currentStep);
             response.setErrorMessage(errorMessage);
@@ -509,32 +529,4 @@ public class FlowService {
         }
     }
 
-    private void updateExecutionStatus(String executionId, String status, String currentStep, String errorMessage) {
-        Map<String, Object> statusUpdate = new HashMap<>();
-        statusUpdate.put("status", status);
-        statusUpdate.put("currentStep", currentStep);
-        statusUpdate.put("errorMessage", errorMessage);
-
-        webClient.patch()
-            .uri(controlCenterBaseUrl + "/api/processes/" + executionId + "/status")
-            .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue(statusUpdate)
-            .retrieve()
-            .toBodilessEntity()
-            .block();
-    }
-
-    private void updateStepStatus(String executionId, int stepOrder, String status, String errorMessage) {
-        Map<String, Object> statusUpdate = new HashMap<>();
-        statusUpdate.put("status", status);
-        statusUpdate.put("errorMessage", errorMessage);
-
-        webClient.put()
-            .uri(controlCenterBaseUrl + "/api/processes/" + executionId + "/steps/" + stepOrder)
-            .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue(statusUpdate)
-            .retrieve()
-            .toBodilessEntity()
-            .block();
-    }
 }

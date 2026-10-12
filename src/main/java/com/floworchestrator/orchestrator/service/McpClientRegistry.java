@@ -8,15 +8,20 @@ import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.client.transport.HttpClientStreamableHttpTransport;
 import io.modelcontextprotocol.spec.McpSchema;
 import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 @Component
 public class McpClientRegistry implements McpToolClient {
+    private static final Logger log = LoggerFactory.getLogger(McpClientRegistry.class);
+
     private final FlowDefinitions flowDefinitions;
     private final ObjectMapper objectMapper;
     private final Map<String, McpSyncClient> clients = new ConcurrentHashMap<>();
@@ -28,21 +33,44 @@ public class McpClientRegistry implements McpToolClient {
 
     @Override
     public List<DiscoveredTool> listTools(String serverName) {
-        return client(serverName).listTools().tools().stream()
+        return withRetry(serverName, client -> client.listTools().tools().stream()
                 .map(tool -> new DiscoveredTool(tool.name(), tool.description(), tool.inputSchema()))
-                .toList();
+                .toList());
     }
 
     @Override
     public Map<String, Object> callTool(String serverName, String toolName, Map<String, Object> arguments) {
-        McpSchema.CallToolResult result = client(serverName).callTool(
-                McpSchema.CallToolRequest.builder(toolName)
-                        .arguments(arguments)
-                        .build());
-        if (Boolean.TRUE.equals(result.isError())) {
-            throw new IllegalStateException("MCP tool failed: " + textContent(result));
+        return withRetry(serverName, client -> {
+            McpSchema.CallToolResult result = client.callTool(
+                    McpSchema.CallToolRequest.builder(toolName)
+                            .arguments(arguments)
+                            .build());
+            if (Boolean.TRUE.equals(result.isError())) {
+                throw new IllegalStateException("MCP tool failed: " + textContent(result));
+            }
+            return parseResult(textContent(result));
+        });
+    }
+
+    private <T> T withRetry(String serverName, Function<McpSyncClient, T> operation) {
+        try {
+            return operation.apply(client(serverName));
+        } catch (RuntimeException ex) {
+            log.warn("[MCP] Session invalidated for '{}', recreating client and retrying: {}", serverName, ex.getMessage());
+            invalidateClient(serverName);
+            return operation.apply(client(serverName));
         }
-        return parseResult(textContent(result));
+    }
+
+    private void invalidateClient(String serverName) {
+        McpSyncClient staleClient = clients.remove(serverName);
+        if (staleClient != null) {
+            try {
+                staleClient.closeGracefully();
+            } catch (Exception e) {
+                log.warn("[MCP] Failed to close stale client for '{}': {}", serverName, e.getMessage());
+            }
+        }
     }
 
     private McpSyncClient client(String serverName) {
@@ -54,12 +82,14 @@ public class McpClientRegistry implements McpToolClient {
         if (baseUrl == null || baseUrl.isBlank()) {
             throw new IllegalArgumentException("MCP server URL is not configured: " + serverName);
         }
+        log.info("[MCP] Creating client for '{}': baseUrl={}", serverName, baseUrl);
         HttpClientStreamableHttpTransport transport = HttpClientStreamableHttpTransport
                 .builder(baseUrl)
                 .endpoint("/mcp")
                 .build();
         McpSyncClient client = McpClient.sync(transport).build();
         client.initialize();
+        log.info("[MCP] Client initialized for '{}'", serverName);
         return client;
     }
 
@@ -84,7 +114,13 @@ public class McpClientRegistry implements McpToolClient {
 
     @PreDestroy
     public void closeClients() {
-        clients.values().forEach(McpSyncClient::closeGracefully);
+        clients.values().forEach(client -> {
+            try {
+                client.closeGracefully();
+            } catch (Exception e) {
+                log.warn("[MCP] Error closing client during shutdown: {}", e.getMessage());
+            }
+        });
         clients.clear();
     }
 }

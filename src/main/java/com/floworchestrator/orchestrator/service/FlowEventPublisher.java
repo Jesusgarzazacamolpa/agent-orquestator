@@ -1,6 +1,8 @@
 package com.floworchestrator.orchestrator.service;
 
 import com.floworchestrator.orchestrator.model.FlowExecutionEvent;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
@@ -12,7 +14,10 @@ import reactor.core.publisher.Sinks;
 @Component
 public class FlowEventPublisher {
 
-    private final Sinks.Many<FlowExecutionEvent> sink = Sinks.many().replay().limit(100);
+    private static final Logger log = LoggerFactory.getLogger(FlowEventPublisher.class);
+    private static final int REPLAY_LIMIT = 100;
+
+    private final Sinks.Many<FlowExecutionEvent> sink = Sinks.many().replay().limit(REPLAY_LIMIT);
 
     /**
      * Publica un evento de ejecución en el stream.
@@ -20,7 +25,11 @@ public class FlowEventPublisher {
      * @param event Evento a publicar.
      */
     public void publish(FlowExecutionEvent event) {
-        sink.tryEmitNext(event);
+        Sinks.EmitResult result = sink.tryEmitNext(event);
+        if (result.isFailure()) {
+            log.warn("[SSE] Failed to publish event: type={}, executionId={}, result={}",
+                    event.eventType(), event.executionId(), result);
+        }
     }
 
     /**

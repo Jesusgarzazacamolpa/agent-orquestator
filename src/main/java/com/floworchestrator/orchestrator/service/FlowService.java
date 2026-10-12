@@ -8,11 +8,9 @@ import com.floworchestrator.orchestrator.config.FlowDefinitions.ToolDefinition;
 import com.floworchestrator.orchestrator.model.FlowExecutionEvent;
 import com.floworchestrator.orchestrator.model.FlowRequest;
 import com.floworchestrator.orchestrator.model.FlowResponse;
-import com.floworchestrator.orchestrator.model.FlowStepExecution;
 import com.floworchestrator.orchestrator.service.McpToolClient.DiscoveredTool;
 import org.stringtemplate.v4.ST;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
@@ -23,6 +21,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -31,6 +30,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 @Service
 public class FlowService {
@@ -112,41 +112,12 @@ public class FlowService {
         validateFlow(flow);
         log.info("[START] Starting flow: flowId={}", flowId);
 
-        String executionId = request.getExecutionId();
-        if (executionId == null || executionId.isBlank()) {
-            Map<String, Object> templateResponse = webClient.get()
-                    .uri(UriComponentsBuilder.fromUriString(controlCenterBaseUrl + "/api/process-templates/by-name")
-                            .queryParam("name", flow.getProcessTemplateName())
-                            .build()
-                            .encode()
-                            .toUri())
-                    .retrieve()
-                    .bodyToMono(Map.class)
-                    .block();
-            if (templateResponse == null || templateResponse.get("id") == null) {
-                throw new IllegalStateException("Control Center did not return an active process template ID");
-            }
-
-            Map<String, Object> controlCenterRequest = new HashMap<>();
-            controlCenterRequest.put("processTemplateId", templateResponse.get("id"));
-            controlCenterRequest.put("customerId", request.getCustomerId());
-
-            Map<String, Object> controlCenterResponse = webClient.post()
-                    .uri(controlCenterBaseUrl + "/api/processes")
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .bodyValue(controlCenterRequest)
-                    .retrieve()
-                    .bodyToMono(Map.class)
-                    .block();
-            if (controlCenterResponse == null || controlCenterResponse.get("id") == null) {
-                throw new IllegalStateException("Control Center did not return a process execution ID");
-            }
-            executionId = controlCenterResponse.get("id").toString();
-        }
+        String executionId = resolveExecutionId(flow, request);
         log.info("[ID] Process execution created: flowId={}, executionId={}", flowId, executionId);
         flowEventPublisher.publish(new FlowExecutionEvent(
                 executionId, flowId, "FLOW_STARTED", null, null, null, null, "IN_PROGRESS", null,
-                java.time.OffsetDateTime.now()));
+                OffsetDateTime.now()));
+
         FlowResponse response = new FlowResponse();
         response.setId(executionId);
         response.setCustomerId(request.getCustomerId());
@@ -154,7 +125,67 @@ public class FlowService {
         response.setSalesAgentId(request.getSalesAgentId());
         response.setSteps(flow.getTools().stream().map(ToolDefinition::getStepName).toList());
 
-        List<Map<String, Object>> messages = new ArrayList<>();
+        List<Map<String, Object>> messages = buildPromptMessages(flow, request, flowId);
+
+        AgentLoopState state = new AgentLoopState();
+        try {
+            log.info("[info] Entering agent loop: flowId={}, executionId={}, maxAgentTurns={}",
+                    flowId, executionId, maxAgentTurns);
+            boolean completed = runAgentLoop(flow, flowId, executionId, response, messages, state);
+            if (!completed) {
+                throw new IllegalStateException("Agent exceeded the maximum number of turns");
+            }
+        } catch (RuntimeException ex) {
+            String errorMessage = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+            log.error("[FAIL] Flow failed: flowId={}, executionId={}, step={}, errorType={}, message={}",
+                    flowId, executionId, state.currentStep, ex.getClass().getSimpleName(), errorMessage);
+            flowEventPublisher.publish(new FlowExecutionEvent(
+                    executionId, flowId, "FLOW_FAILED", state.currentStepOrder, state.currentStep,
+                    null, null, "FAILED", errorMessage, OffsetDateTime.now()));
+            response.setStatus("FAILED");
+            response.setCurrentStep(state.currentStep);
+            response.setErrorMessage(errorMessage);
+        }
+
+        return response;
+    }
+
+    private String resolveExecutionId(FlowDefinition flow, FlowRequest request) {
+        String executionId = request.getExecutionId();
+        if (executionId != null && !executionId.isBlank()) {
+            return executionId;
+        }
+        Map<String, Object> templateResponse = webClient.get()
+                .uri(UriComponentsBuilder.fromUriString(controlCenterBaseUrl + "/api/process-templates/by-name")
+                        .queryParam("name", flow.getProcessTemplateName())
+                        .build()
+                        .encode()
+                        .toUri())
+                .retrieve()
+                .bodyToMono(Map.class)
+                .block();
+        if (templateResponse == null || templateResponse.get("id") == null) {
+            throw new IllegalStateException("Control Center did not return an active process template ID");
+        }
+
+        Map<String, Object> controlCenterRequest = new HashMap<>();
+        controlCenterRequest.put("processTemplateId", templateResponse.get("id"));
+        controlCenterRequest.put("customerId", request.getCustomerId());
+
+        Map<String, Object> controlCenterResponse = webClient.post()
+                .uri(controlCenterBaseUrl + "/api/processes")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(controlCenterRequest)
+                .retrieve()
+                .bodyToMono(Map.class)
+                .block();
+        if (controlCenterResponse == null || controlCenterResponse.get("id") == null) {
+            throw new IllegalStateException("Control Center did not return a process execution ID");
+        }
+        return controlCenterResponse.get("id").toString();
+    }
+
+    private List<Map<String, Object>> buildPromptMessages(FlowDefinition flow, FlowRequest request, String flowId) {
         Map<String, Object> promptAttributes = new HashMap<>();
         promptAttributes.put("flowId", flowId);
         promptAttributes.put("flowName", flow.getProcessTemplateName());
@@ -162,6 +193,8 @@ public class FlowService {
         promptAttributes.put("vehicleId", request.getVehicleId());
         promptAttributes.put("salesAgentId", request.getSalesAgentId());
         promptAttributes.put("toolNames", flow.getTools().stream().map(ToolDefinition::getName).toList());
+
+        List<Map<String, Object>> messages = new ArrayList<>();
         messages.add(Map.of(
                 "role", "system",
                 "content", renderPrompt(flow.getSystemPromptTemplate(), promptAttributes)
@@ -170,161 +203,174 @@ public class FlowService {
                 "role", "user",
                 "content", renderPrompt(flow.getUserPromptTemplate(), promptAttributes)
         ));
+        return messages;
+    }
 
-        Set<String> completedTools = new HashSet<>();
-        Map<String, Map<String, Object>> toolResults = new HashMap<>();
-        Map<String, List<DiscoveredTool>> discoveredByServer = new HashMap<>();
-        int currentStepOrder = 0;
-        String currentStep = null;
+    private boolean runAgentLoop(FlowDefinition flow, String flowId, String executionId,
+                              FlowResponse response, List<Map<String, Object>> messages,
+                              AgentLoopState state) {
+        for (int turn = 0; turn < maxAgentTurns; turn++) {
+            log.info("[info] Turn {} starting: flowId={}, executionId={}", turn + 1, flowId, executionId);
+            log.info("[info] Calling getToolDefinitions: flowId={}, executionId={}, completedTools={}",
+                    flowId, executionId, state.completedTools);
+            List<Map<String, Object>> availableTools = getToolDefinitions(flow, state.completedTools, state.discoveredByServer);
+            log.info("[info] getToolDefinitions returned {} tools: flowId={}, executionId={}, tools={}",
+                    availableTools.size(), flowId, executionId,
+                    availableTools.stream().map(t -> String.valueOf(((Map<?, ?>) t.get("function")).get("name"))).toList());
+            log.info("[AGENT] Requesting decision: flowId={}, executionId={}, turn={}/{}",
+                    flowId, executionId, turn + 1, maxAgentTurns);
+            log.info("[info] Calling Ollama: flowId={}, executionId={}, ollamaBaseUrl={}, model={}",
+                    flowId, executionId, ollamaBaseUrl, ollamaModel);
 
-        try {
-            log.info("[info] Entering agent loop: flowId={}, executionId={}, maxAgentTurns={}",
-                    flowId, executionId, maxAgentTurns);
-            List<Map<String, Object>> availableTools;
-            for (int turn = 0; turn < maxAgentTurns; turn++) {
-                log.info("[info] Turn {} starting: flowId={}, executionId={}", turn + 1, flowId, executionId);
-                log.info("[info] Calling getToolDefinitions: flowId={}, executionId={}, completedTools={}",
-                        flowId, executionId, completedTools);
-                availableTools = getToolDefinitions(flow, completedTools, discoveredByServer);
-                log.info("[info] getToolDefinitions returned {} tools: flowId={}, executionId={}, tools={}",
-                        availableTools.size(), flowId, executionId,
-                        availableTools.stream().map(t -> String.valueOf(((Map<?, ?>) t.get("function")).get("name"))).toList());
-                log.info("[AGENT] Requesting decision: flowId={}, executionId={}, turn={}/{}",
-                        flowId, executionId, turn + 1, maxAgentTurns);
-                log.info("[info] Calling Ollama: flowId={}, executionId={}, ollamaBaseUrl={}, model={}",
-                        flowId, executionId, ollamaBaseUrl, ollamaModel);
-                Map<String, Object> ollamaRequest = new HashMap<>();
-                ollamaRequest.put("model", ollamaModel);
-                ollamaRequest.put("messages", messages);
-                ollamaRequest.put("tools", availableTools);
-                ollamaRequest.put("stream", false);
-                ollamaRequest.put("tool_choice", "required");
-                ollamaRequest.put("options", Map.of("temperature", 0.0, "top_p", 0.1));
-                Map<String, Object> ollamaResponse = webClient.post()
-                        .uri(ollamaBaseUrl + "/api/chat")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .bodyValue(ollamaRequest)
-                        .retrieve()
-                        .bodyToMono(Map.class)
-                        .block();
-                log.info("[info] Ollama response received: flowId={}, executionId={}, response={}",
-                        flowId, executionId, ollamaResponse);
-                Map<String, Object> assistantMessage = asMap(ollamaResponse == null ? null : ollamaResponse.get("message"));
-                if (assistantMessage.isEmpty()) {
-                    throw new IllegalStateException("Ollama returned an empty assistant message");
-                }
-                messages.add(assistantMessage);
-
-                List<?> toolCalls = assistantMessage.get("tool_calls") instanceof List<?> calls ? calls : List.of();
-                if (toolCalls.isEmpty()) {
-                    // Intentar parsear tool calls embebidas como texto en content
-                    String content = String.valueOf(assistantMessage.getOrDefault("content", ""));
-                    List<Map<String, Object>> parsedToolCalls = parseToolCallsFromContent(content, flow, flowId, executionId);
-                    if (!parsedToolCalls.isEmpty()) {
-                        log.info("[PARSE] Tool calls parsed from content: flowId={}, executionId={}, toolCalls={}",
-                                flowId, executionId, parsedToolCalls);
-                        toolCalls = parsedToolCalls;
-                    } else {
-                        log.warn("[NO_TOOLS] Ollama response without tool_calls and no parseable content: flowId={}, executionId={}, content={}",
-                                flowId, executionId, content);
-                    }
-                } else {
-                    log.info("[TOOLS] Ollama returned tool_calls directly: flowId={}, executionId={}, toolCalls={}",
-                            flowId, executionId, toolCalls);
-                }
-                if (toolCalls.isEmpty()) {
-                    Set<String> requiredTools = getRequiredTools(flow);
-                    if (!completedTools.containsAll(requiredTools)) {
-                        throw new IllegalStateException("Agent finished before completing all required tools: " +
-                                difference(requiredTools, completedTools));
-                    }
-                    log.info("[DONE] Flow update status completed: flowId={}, executionId={}", flowId, executionId);
-                    flowEventPublisher.publish(new FlowExecutionEvent(
-                            executionId, flowId, "FLOW_COMPLETED", null, null, null, null,
-                            "COMPLETED", null, java.time.OffsetDateTime.now()));
-                    response.setStatus("COMPLETED");
-                    response.setMessage(String.valueOf(assistantMessage.getOrDefault("content", "")));
-                    log.info("[DONE] Flow completed: flowId={}, executionId={}", flowId, executionId);
-                    return response;
-                }
-
-                for (Object rawToolCall : toolCalls) {
-                    Map<String, Object> toolCall = asMap(rawToolCall);
-                    Map<String, Object> function = asMap(toolCall.get("function"));
-                    String toolName = String.valueOf(function.get("name"));
-                    log.info("[info] Processing tool call: flowId={}, executionId={}, toolName={}",
-                            flowId, executionId, toolName);
-                    ToolDefinition tool;
-                    try {
-                        tool = findTool(flow, toolName);
-                    } catch (IllegalArgumentException ex) {
-                        log.warn("[BLOCKED] Agent requested a tool not allowed by the flow: flowId={}, executionId={}, tool={}",
-                                flowId, executionId, toolName);
-                        addToolErrorMessage(messages, toolName, ex.getMessage());
-                        continue;
-                    }
-
-                    Map<String, Object> arguments = asMap(function.get("arguments"));
-                    try {
-                        validateToolCall(tool, arguments, completedTools);
-                    } catch (IllegalArgumentException ex) {
-                        log.warn("[RETRY] Agent tool call rejected: flowId={}, executionId={}, tool={}, reason={}",
-                            flowId, executionId, toolName, ex.getMessage());
-                        addToolErrorMessage(messages, toolName, ex.getMessage());
-                        continue;
-                    }
-
-                    if (!completedTools.contains(toolName)) {
-                        currentStepOrder = tool.getStepOrder();
-                        currentStep = tool.getStepName();
-                        log.info("[CALL] Agent requested MCP tool: flowId={}, executionId={}, server={}, tool={}, step={}",
-                                flowId, executionId, tool.getServer(), toolName, currentStep);
-                        flowEventPublisher.publish(new FlowExecutionEvent(
-                                executionId, flowId, "STEP_STARTED", currentStepOrder, currentStep,
-                                toolName, tool.getServer(), "RUNNING", null, java.time.OffsetDateTime.now()));
-                        long toolStartedAt = System.nanoTime();
-                        try {
-                            Map<String, Object> result = executeTool(tool, arguments);
-                            toolResults.put(toolName, result);
-                            completedTools.add(toolName);
-                            flowEventPublisher.publish(new FlowExecutionEvent(
-                                    executionId, flowId, "STEP_COMPLETED", currentStepOrder, currentStep,
-                                    toolName, tool.getServer(), "COMPLETED", null, java.time.OffsetDateTime.now()));
-                        } catch (RuntimeException ex) {
-                            String toolError = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
-                            flowEventPublisher.publish(new FlowExecutionEvent(
-                                    executionId, flowId, "STEP_FAILED", currentStepOrder, currentStep,
-                                    toolName, tool.getServer(), "FAILED", toolError, java.time.OffsetDateTime.now()));
-                            throw ex;
-                        }
-                        log.info("[OK] MCP tool completed: flowId={}, executionId={}, tool={}, durationMs={}",
-                                flowId, executionId, toolName,
-                                (System.nanoTime() - toolStartedAt) / 1_000_000);
-                    }
-
-                    Map<String, Object> toolMessage = new HashMap<>();
-                    toolMessage.put("role", "tool");
-                    toolMessage.put("tool_name", toolName);
-                    toolMessage.put("content", writeJson(toolResults.get(toolName)));
-                    messages.add(toolMessage);
-                    currentStepOrder = 0;
-                    currentStep = null;
-                }
+            Map<String, Object> ollamaRequest = new HashMap<>();
+            ollamaRequest.put("model", ollamaModel);
+            ollamaRequest.put("messages", messages);
+            ollamaRequest.put("tools", availableTools);
+            ollamaRequest.put("stream", false);
+            ollamaRequest.put("tool_choice", "required");
+            ollamaRequest.put("options", Map.of("temperature", 0.0, "top_p", 0.1));
+            Map<String, Object> ollamaResponse = webClient.post()
+                    .uri(ollamaBaseUrl + "/api/chat")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue(ollamaRequest)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+            log.info("[info] Ollama response received: flowId={}, executionId={}, response={}",
+                    flowId, executionId, ollamaResponse);
+            Map<String, Object> assistantMessage = asMap(ollamaResponse == null ? null : ollamaResponse.get("message"));
+            if (assistantMessage.isEmpty()) {
+                throw new IllegalStateException("Ollama returned an empty assistant message");
             }
-            throw new IllegalStateException("Agent exceeded the maximum number of turns");
-        } catch (RuntimeException ex) {
-            String errorMessage = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
-            log.error("[FAIL] Flow failed: flowId={}, executionId={}, step={}, errorType={}, message={}",
-                    flowId, executionId, currentStep, ex.getClass().getSimpleName(), errorMessage);
-            flowEventPublisher.publish(new FlowExecutionEvent(
-                    executionId, flowId, "FLOW_FAILED", currentStepOrder, currentStep,
-                    null, null, "FAILED", errorMessage, java.time.OffsetDateTime.now()));
-            response.setStatus("FAILED");
-            response.setCurrentStep(currentStep);
-            response.setErrorMessage(errorMessage);
-        }
+            messages.add(assistantMessage);
 
-        return response;
+            List<?> toolCalls = resolveToolCalls(assistantMessage, flow, flowId, executionId);
+            if (toolCalls.isEmpty()) {
+                completeFlow(flow, flowId, executionId, response, assistantMessage, state.completedTools);
+                return true;
+            }
+
+            processToolCalls(flow, flowId, executionId, messages, state, toolCalls);
+        }
+        return false;
+    }
+
+    private List<?> resolveToolCalls(Map<String, Object> assistantMessage, FlowDefinition flow,
+                                     String flowId, String executionId) {
+        List<?> toolCalls = assistantMessage.get("tool_calls") instanceof List<?> calls ? calls : List.of();
+        if (!toolCalls.isEmpty()) {
+            log.info("[TOOLS] Ollama returned tool_calls directly: flowId={}, executionId={}, toolCalls={}",
+                    flowId, executionId, toolCalls);
+            return toolCalls;
+        }
+        String content = String.valueOf(assistantMessage.getOrDefault("content", ""));
+        List<Map<String, Object>> parsedToolCalls = parseToolCallsFromContent(content, flow, flowId, executionId);
+        if (!parsedToolCalls.isEmpty()) {
+            log.info("[PARSE] Tool calls parsed from content: flowId={}, executionId={}, toolCalls={}",
+                    flowId, executionId, parsedToolCalls);
+            return parsedToolCalls;
+        }
+        log.warn("[NO_TOOLS] Ollama response without tool_calls and no parseable content: flowId={}, executionId={}, content={}",
+                flowId, executionId, content);
+        return List.of();
+    }
+
+    private void completeFlow(FlowDefinition flow, String flowId, String executionId,
+                              FlowResponse response, Map<String, Object> assistantMessage,
+                              Set<String> completedTools) {
+        Set<String> requiredTools = getRequiredTools(flow);
+        if (!completedTools.containsAll(requiredTools)) {
+            throw new IllegalStateException("Agent finished before completing all required tools: " +
+                    difference(requiredTools, completedTools));
+        }
+        log.info("[DONE] Flow update status completed: flowId={}, executionId={}", flowId, executionId);
+        flowEventPublisher.publish(new FlowExecutionEvent(
+                executionId, flowId, "FLOW_COMPLETED", null, null, null, null,
+                "COMPLETED", null, OffsetDateTime.now()));
+        response.setStatus("COMPLETED");
+        response.setMessage(String.valueOf(assistantMessage.getOrDefault("content", "")));
+        log.info("[DONE] Flow completed: flowId={}, executionId={}", flowId, executionId);
+    }
+
+    private void processToolCalls(FlowDefinition flow, String flowId, String executionId,
+                                  List<Map<String, Object>> messages, AgentLoopState state,
+                                  List<?> toolCalls) {
+        for (Object rawToolCall : toolCalls) {
+            Map<String, Object> toolCall = asMap(rawToolCall);
+            Map<String, Object> function = asMap(toolCall.get("function"));
+            String toolName = String.valueOf(function.get("name"));
+            log.info("[info] Processing tool call: flowId={}, executionId={}, toolName={}",
+                    flowId, executionId, toolName);
+            ToolDefinition tool;
+            try {
+                tool = findTool(flow, toolName);
+            } catch (IllegalArgumentException ex) {
+                log.warn("[BLOCKED] Agent requested a tool not allowed by the flow: flowId={}, executionId={}, tool={}",
+                        flowId, executionId, toolName);
+                addToolErrorMessage(messages, toolName, ex.getMessage());
+                continue;
+            }
+
+            Map<String, Object> arguments = asMap(function.get("arguments"));
+            try {
+                validateToolCall(tool, arguments, state.completedTools);
+            } catch (IllegalArgumentException ex) {
+                log.warn("[RETRY] Agent tool call rejected: flowId={}, executionId={}, tool={}, reason={}",
+                        flowId, executionId, toolName, ex.getMessage());
+                addToolErrorMessage(messages, toolName, ex.getMessage());
+                continue;
+            }
+
+            if (!state.completedTools.contains(toolName)) {
+                executeToolStep(flow, flowId, executionId, messages, state, tool, toolName, arguments);
+            }
+
+            Map<String, Object> toolMessage = new HashMap<>();
+            toolMessage.put("role", "tool");
+            toolMessage.put("tool_name", toolName);
+            toolMessage.put("content", writeJson(state.toolResults.get(toolName)));
+            messages.add(toolMessage);
+            state.currentStepOrder = 0;
+            state.currentStep = null;
+        }
+    }
+
+    private void executeToolStep(FlowDefinition flow, String flowId, String executionId,
+                                 List<Map<String, Object>> messages, AgentLoopState state,
+                                 ToolDefinition tool, String toolName, Map<String, Object> arguments) {
+        state.currentStepOrder = tool.getStepOrder();
+        state.currentStep = tool.getStepName();
+        log.info("[CALL] Agent requested MCP tool: flowId={}, executionId={}, server={}, tool={}, step={}",
+                flowId, executionId, tool.getServer(), toolName, state.currentStep);
+        flowEventPublisher.publish(new FlowExecutionEvent(
+                executionId, flowId, "STEP_STARTED", state.currentStepOrder, state.currentStep,
+                toolName, tool.getServer(), "RUNNING", null, OffsetDateTime.now()));
+        long toolStartedAt = System.nanoTime();
+        try {
+            Map<String, Object> result = executeTool(tool, arguments);
+            state.toolResults.put(toolName, result);
+            state.completedTools.add(toolName);
+            flowEventPublisher.publish(new FlowExecutionEvent(
+                    executionId, flowId, "STEP_COMPLETED", state.currentStepOrder, state.currentStep,
+                    toolName, tool.getServer(), "COMPLETED", null, OffsetDateTime.now()));
+        } catch (RuntimeException ex) {
+            String toolError = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+            flowEventPublisher.publish(new FlowExecutionEvent(
+                    executionId, flowId, "STEP_FAILED", state.currentStepOrder, state.currentStep,
+                    toolName, tool.getServer(), "FAILED", toolError, OffsetDateTime.now()));
+            throw ex;
+        }
+        log.info("[OK] MCP tool completed: flowId={}, executionId={}, tool={}, durationMs={}",
+                flowId, executionId, toolName,
+                (System.nanoTime() - toolStartedAt) / 1_000_000);
+    }
+
+    private static final class AgentLoopState {
+        private final Set<String> completedTools = new HashSet<>();
+        private final Map<String, Map<String, Object>> toolResults = new HashMap<>();
+        private final Map<String, List<DiscoveredTool>> discoveredByServer = new HashMap<>();
+        private int currentStepOrder = 0;
+        private String currentStep = null;
     }
 
     /**
@@ -362,7 +408,7 @@ public class FlowService {
         return flow.getTools().stream()
                 .filter(ToolDefinition::isRequired)
                 .map(ToolDefinition::getName)
-                .collect(java.util.stream.Collectors.toSet());
+                .collect(Collectors.toSet());
     }
 
     private void validateToolCall(
@@ -478,8 +524,9 @@ public class FlowService {
                                 toolName, flow.getTools().stream().map(ToolDefinition::getName).toList());
                         continue;
                     }
-                    Map<String, Object> arguments = (Map<String, Object>) parsed.getOrDefault("parameters",
-                            parsed.getOrDefault("arguments", Map.of()));
+                    Map<String, Object> arguments = asMap(parsed.containsKey("parameters")
+                            ? parsed.get("parameters")
+                            : parsed.get("arguments"));
                     Map<String, Object> toolCall = new HashMap<>();
                     toolCall.put("id", "call_" + System.nanoTime());
                     Map<String, Object> function = new HashMap<>();

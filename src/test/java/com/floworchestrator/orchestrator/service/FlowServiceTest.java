@@ -58,10 +58,10 @@ class FlowServiceTest {
         );
 
         FlowRequest request = new FlowRequest();
-        request.setCustomerId("customer-001");
-        request.setVehicleId("vehicle-123");
-        request.setSalesAgentId("agent-77");
-        request.setFlowId("Compra de vehiculo");
+        request.setFlowId("compra-vehiculo");
+        request.getAttributes().put("customerId", "customer-001");
+        request.getAttributes().put("vehicleId", "vehicle-123");
+        request.getAttributes().put("salesAgentId", "agent-77");
 
         try {
             var flow = service.createFlow(request);
@@ -69,8 +69,8 @@ class FlowServiceTest {
             assertTrue(latch.await(5, TimeUnit.SECONDS), "Esperando eventos SSE");
             assertEquals("execution-123", flow.getId());
             assertEquals("COMPLETED", flow.getStatus());
-            assertEquals("customer-001", flow.getCustomerId());
-            assertEquals("vehicle-123", flow.getVehicleId());
+            assertEquals("customer-001", flow.getAttributes().get("customerId"));
+            assertEquals("vehicle-123", flow.getAttributes().get("vehicleId"));
             assertFalse(flow.getSteps().isEmpty());
 
             assertTrue(events.stream().anyMatch(e -> "FLOW_STARTED".equals(e.eventType())
@@ -120,10 +120,10 @@ class FlowServiceTest {
                 publisher
         );
         FlowRequest request = new FlowRequest();
-        request.setCustomerId("customer-001");
-        request.setVehicleId("vehicle-123");
-        request.setSalesAgentId("agent-77");
-        request.setFlowId("Compra de vehiculo");
+        request.setFlowId("compra-vehiculo");
+        request.getAttributes().put("customerId", "customer-001");
+        request.getAttributes().put("vehicleId", "vehicle-123");
+        request.getAttributes().put("salesAgentId", "agent-77");
 
         try {
             var flow = service.createFlow(request);

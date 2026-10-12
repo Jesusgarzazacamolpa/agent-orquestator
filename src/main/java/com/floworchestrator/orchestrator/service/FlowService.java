@@ -120,9 +120,7 @@ public class FlowService {
 
         FlowResponse response = new FlowResponse();
         response.setId(executionId);
-        response.setCustomerId(request.getCustomerId());
-        response.setVehicleId(request.getVehicleId());
-        response.setSalesAgentId(request.getSalesAgentId());
+        response.setAttributes(request.getAttributes());
         response.setSteps(flow.getTools().stream().map(ToolDefinition::getStepName).toList());
 
         List<Map<String, Object>> messages = buildPromptMessages(flow, request, flowId);
@@ -170,7 +168,7 @@ public class FlowService {
 
         Map<String, Object> controlCenterRequest = new HashMap<>();
         controlCenterRequest.put("processTemplateId", templateResponse.get("id"));
-        controlCenterRequest.put("customerId", request.getCustomerId());
+        controlCenterRequest.put("customerId", request.getAttributes().get("customerId"));
 
         Map<String, Object> controlCenterResponse = webClient.post()
                 .uri(controlCenterBaseUrl + "/api/processes")
@@ -189,9 +187,7 @@ public class FlowService {
         Map<String, Object> promptAttributes = new HashMap<>();
         promptAttributes.put("flowId", flowId);
         promptAttributes.put("flowName", flow.getProcessTemplateName());
-        promptAttributes.put("customerId", request.getCustomerId());
-        promptAttributes.put("vehicleId", request.getVehicleId());
-        promptAttributes.put("salesAgentId", request.getSalesAgentId());
+        promptAttributes.putAll(request.getAttributes());
         promptAttributes.put("toolNames", flow.getTools().stream().map(ToolDefinition::getName).toList());
 
         List<Map<String, Object>> messages = new ArrayList<>();

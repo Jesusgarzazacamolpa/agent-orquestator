@@ -15,6 +15,12 @@ public class FlowResponse {
     private String status = "CREATED";
     private String currentStep;
     private String errorMessage;
+    private String userErrorTitle;
+    private String userErrorMessage;
+    private String userErrorActionLabel;
+    private String userErrorStatusType;
+    private String flowCode;
+    private String traceId;
     private String message;
     private List<String> steps;
     private Map<String, Object> attributes = new HashMap<>();

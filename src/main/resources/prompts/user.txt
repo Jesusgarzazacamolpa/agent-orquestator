@@ -1,0 +1,5 @@
+Procesa el flujo ${flowName} (${flowId}) para el cliente ${customerId}.
+Vehículo: ${vehicleId}
+Agente: ${salesAgentId}
+
+Usa las herramientas disponibles según sea necesario para completar el flujo.

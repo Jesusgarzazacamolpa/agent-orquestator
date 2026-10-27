@@ -3,33 +3,26 @@ package com.floworchestrator.orchestrator.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.floworchestrator.orchestrator.config.FlowDefinitions;
 import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
 class McpClientRegistryIntegrationTest {
-
-    @Autowired
-    private FlowDefinitions flowDefinitions;
-
-    @Autowired
-    private ObjectMapper objectMapper;
 
     @Test
     void javaClientDiscoversAndCallsNodeMcpTool() throws Exception {
+        FlowDefinitions flowDefinitions = new FlowDefinitions();
+        ObjectMapper objectMapper = new ObjectMapper();
         int port = availablePort();
         Path notificationsDirectory = Path.of("..", "mcp-notifications").toAbsolutePath().normalize();
         ProcessBuilder processBuilder = new ProcessBuilder("node", "server.js")

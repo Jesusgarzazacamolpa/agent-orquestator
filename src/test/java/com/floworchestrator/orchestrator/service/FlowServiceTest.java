@@ -1,280 +1,421 @@
 package com.floworchestrator.orchestrator.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.floworchestrator.orchestrator.config.FlowDefinitions;
+import com.floworchestrator.orchestrator.model.FlowAsyncAccepted;
 import com.floworchestrator.orchestrator.model.FlowExecutionEvent;
 import com.floworchestrator.orchestrator.model.FlowRequest;
-import com.floworchestrator.orchestrator.service.McpToolClient;
+import com.floworchestrator.orchestrator.model.FlowResponse;
 import com.floworchestrator.orchestrator.service.McpToolClient.DiscoveredTool;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.retry.RetryConfig;
+import io.github.resilience4j.retry.RetryRegistry;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
+import org.mockito.ArgumentCaptor;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.ToolResponseMessage;
+import org.springframework.ai.chat.metadata.ChatResponseMetadata;
+import org.springframework.ai.chat.metadata.DefaultUsage;
+import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.model.Generation;
+import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
 class FlowServiceTest {
 
-    @Autowired
     private FlowDefinitions flowDefinitions;
+    private ChatModel chatModel;
+    private FlowEventPublisher publisher;
+    private CircuitBreakerRegistry circuitBreakerRegistry;
+    private RetryRegistry retryRegistry;
+    private HttpServer controlCenter;
+
+    @BeforeEach
+    void setUp() throws IOException {
+        flowDefinitions = buildFlowDefinitions();
+        chatModel = mock(ChatModel.class);
+        publisher = new FlowEventPublisher();
+        circuitBreakerRegistry = CircuitBreakerRegistry.ofDefaults();
+        retryRegistry = RetryRegistry.of(RetryConfig.custom()
+                .maxAttempts(1)
+                .waitDuration(Duration.ZERO)
+                .build());
+        controlCenter = startControlCenter();
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (controlCenter != null) {
+            controlCenter.stop(0);
+        }
+    }
 
     @Test
-    void shouldCompleteFlowAndPublishEvents() throws IOException, InterruptedException {
-        List<List<String>> offeredToolsPerTurn = new CopyOnWriteArrayList<>();
-        HttpServer server = startServer(offeredToolsPerTurn, false);
-        McpToolClient registry = fakeMcpToolClient(false);
-        FlowEventPublisher publisher = new FlowEventPublisher();
+    @DisplayName("debe completar el flujo ejecutando las tools MCP y publicar eventos")
+    void shouldCompleteFlowAndPublishEvents() throws InterruptedException {
+        when(chatModel.call(any(Prompt.class))).thenReturn(
+                toolCallResponse("call-1", "get_vehicle_information"),
+                toolCallResponse("call-2", "register_vehicle_purchase"),
+                toolCallResponse("call-3", "set_payment_method"),
+                toolCallResponse("call-4", "send_purchase_status_email"),
+                textResponse("Flujo completado exitosamente"));
+
         List<FlowExecutionEvent> events = new CopyOnWriteArrayList<>();
-        CountDownLatch latch = new CountDownLatch(10);
+        CountDownLatch completed = new CountDownLatch(1);
         publisher.stream().subscribe(event -> {
             events.add(event);
-            latch.countDown();
-        });
-
-        FlowService service = new FlowService(
-                WebClient.builder(),
-                baseUrl(server),
-                baseUrl(server),
-                "llama3.1",
-                8,
-                new ObjectMapper(),
-                flowDefinitions,
-                registry,
-                publisher
-        );
-
-        FlowRequest request = new FlowRequest();
-        request.setFlowId("compra-vehiculo");
-        request.getAttributes().put("customerId", "customer-001");
-        request.getAttributes().put("vehicleId", "vehicle-123");
-        request.getAttributes().put("salesAgentId", "agent-77");
-
-        try {
-            var flow = service.createFlow(request);
-
-            assertTrue(latch.await(5, TimeUnit.SECONDS), "Esperando eventos SSE");
-            assertEquals("execution-123", flow.getId());
-            assertEquals("COMPLETED", flow.getStatus());
-            assertEquals("customer-001", flow.getAttributes().get("customerId"));
-            assertEquals("vehicle-123", flow.getAttributes().get("vehicleId"));
-            assertFalse(flow.getSteps().isEmpty());
-
-            assertTrue(events.stream().anyMatch(e -> "FLOW_STARTED".equals(e.eventType())
-                    && "execution-123".equals(e.executionId())));
-            for (String tool : List.of("get_vehicle_information", "register_vehicle_purchase",
-                    "set_payment_method", "send_purchase_status_email")) {
-                assertTrue(events.stream().anyMatch(e -> "STEP_STARTED".equals(e.eventType())
-                        && tool.equals(e.toolName())), "Falta STEP_STARTED para " + tool);
-                assertTrue(events.stream().anyMatch(e -> "STEP_COMPLETED".equals(e.eventType())
-                        && tool.equals(e.toolName())), "Falta STEP_COMPLETED para " + tool);
+            if ("FLOW_COMPLETED".equals(event.eventType())) {
+                completed.countDown();
             }
-            assertTrue(events.stream().anyMatch(e -> "FLOW_COMPLETED".equals(e.eventType())));
+        });
 
-            assertEquals(List.of("get_vehicle_information"), offeredToolsPerTurn.get(0));
-            assertEquals(List.of("get_vehicle_information"), offeredToolsPerTurn.get(1));
-            assertEquals(List.of("register_vehicle_purchase"), offeredToolsPerTurn.get(2));
-            assertEquals(List.of("set_payment_method"), offeredToolsPerTurn.get(3));
-            assertEquals(List.of("send_purchase_status_email"), offeredToolsPerTurn.get(4));
-            assertTrue(offeredToolsPerTurn.get(5).isEmpty());
-        } finally {
-            server.stop(0);
-        }
+        FlowService service = buildService(fakeMcpToolClient(false), 8);
+        FlowResponse response = service.createFlow(request());
+
+        assertTrue(completed.await(5, TimeUnit.SECONDS), "Debe publicarse FLOW_COMPLETED");
+        assertEquals("COMPLETED", response.getStatus());
+        assertEquals("execution-123", response.getId());
+        assertNotNull(response.getTraceId());
+        assertEquals("Flujo completado exitosamente", response.getMessage());
+        assertEquals("customer-001", response.getAttributes().get("customerId"));
+
+        List<String> eventTypes = events.stream().map(FlowExecutionEvent::eventType).toList();
+        assertEquals(4, eventTypes.stream().filter("STEP_STARTED"::equals).count());
+        assertEquals(4, eventTypes.stream().filter("STEP_COMPLETED"::equals).count());
+
+        ArgumentCaptor<Prompt> promptCaptor = ArgumentCaptor.forClass(Prompt.class);
+        verify(chatModel, times(5)).call(promptCaptor.capture());
+
+        ToolCallingChatOptions firstOptions = assertInstanceOf(
+                ToolCallingChatOptions.class, promptCaptor.getAllValues().getFirst().getOptions());
+        assertEquals(1, firstOptions.getToolCallbacks().size());
+        assertEquals("get_vehicle_information",
+                firstOptions.getToolCallbacks().getFirst().getToolDefinition().name());
+
+        List<ToolResponseMessage> toolResponses = promptCaptor.getAllValues().get(4).getInstructions()
+                .stream()
+                .filter(ToolResponseMessage.class::isInstance)
+                .map(ToolResponseMessage.class::cast)
+                .toList();
+        assertEquals(4, toolResponses.size(), "El modelo debe recibir los resultados de las 4 tools");
+        assertEquals("call-1", toolResponses.getFirst().getResponses().getFirst().id());
     }
 
     @Test
-    void shouldPublishStepFailedWhenDomainServiceFails() throws IOException, InterruptedException {
-        List<List<String>> offeredToolsPerTurn = new CopyOnWriteArrayList<>();
-        HttpServer server = startServer(offeredToolsPerTurn, true);
-        McpToolClient registry = fakeMcpToolClient(true);
-        FlowEventPublisher publisher = new FlowEventPublisher();
+    @DisplayName("debe completar el flujo si el LLM falla después de ejecutar todos los pasos")
+    void shouldCompleteFlowWhenLlmFailsAfterAllToolsCompleted() throws InterruptedException {
+        when(chatModel.call(any(Prompt.class))).thenReturn(
+                toolCallResponse("call-1", "get_vehicle_information"),
+                toolCallResponse("call-2", "register_vehicle_purchase"),
+                toolCallResponse("call-3", "set_payment_method"),
+                toolCallResponse("call-4", "send_purchase_status_email"))
+                .thenThrow(new IllegalStateException("CircuitBreaker 'llm' is OPEN"));
+
         List<FlowExecutionEvent> events = new CopyOnWriteArrayList<>();
-        CountDownLatch latch = new CountDownLatch(6);
+        CountDownLatch completed = new CountDownLatch(1);
         publisher.stream().subscribe(event -> {
             events.add(event);
-            latch.countDown();
+            if ("FLOW_COMPLETED".equals(event.eventType())) {
+                completed.countDown();
+            }
         });
 
-        FlowService service = new FlowService(
-                WebClient.builder(),
-                baseUrl(server),
-                baseUrl(server),
-                "llama3.1",
-                8,
-                new ObjectMapper(),
-                flowDefinitions,
-                registry,
-                publisher
-        );
+        FlowService service = buildService(fakeMcpToolClient(false), 8);
+        FlowResponse response = service.createFlow(request());
+
+        assertTrue(completed.await(5, TimeUnit.SECONDS),
+                "El flujo debe completarse aunque falle el turno final del LLM");
+        assertEquals("COMPLETED", response.getStatus());
+        assertNotNull(response.getMessage());
+        assertTrue(response.getMessage().contains("se completó correctamente"));
+        assertTrue(events.stream().noneMatch(event -> "FLOW_FAILED".equals(event.eventType())),
+                "No debe publicarse FLOW_FAILED si los pasos de negocio ya terminaron");
+    }
+
+    @Test
+    @DisplayName("debe aceptar el flujo en segundo plano y publicar eventos con el mismo traceId")
+    void shouldStartFlowAsynchronously() throws InterruptedException {
+        when(chatModel.call(any(Prompt.class))).thenReturn(
+                toolCallResponse("call-1", "get_vehicle_information"),
+                toolCallResponse("call-2", "register_vehicle_purchase"),
+                toolCallResponse("call-3", "set_payment_method"),
+                toolCallResponse("call-4", "send_purchase_status_email"),
+                textResponse("Flujo completado exitosamente"));
+
+        List<FlowExecutionEvent> events = new CopyOnWriteArrayList<>();
+        CountDownLatch completed = new CountDownLatch(1);
+        publisher.stream().subscribe(event -> {
+            events.add(event);
+            if ("FLOW_COMPLETED".equals(event.eventType())) {
+                completed.countDown();
+            }
+        });
+
+        FlowService service = buildService(fakeMcpToolClient(false), 8);
+        FlowRequest request = request();
+        request.setExecutionId("execution-async");
+
+        FlowAsyncAccepted accepted = service.startFlowAsync(request);
+
+        assertEquals("ACCEPTED", accepted.status());
+        assertNotNull(accepted.requestId());
+        assertNotNull(accepted.traceId());
+        assertEquals("execution-async", accepted.executionId());
+
+        assertTrue(completed.await(5, TimeUnit.SECONDS), "El flujo debe completarse en segundo plano");
+        FlowExecutionEvent completedEvent = events.stream()
+                .filter(event -> "FLOW_COMPLETED".equals(event.eventType()))
+                .findFirst()
+                .orElseThrow();
+        assertEquals(accepted.traceId(), completedEvent.traceId(),
+                "Los eventos SSE deben correlacionarse con el traceId devuelto");
+    }
+
+    @Test
+    @DisplayName("debe publicar STEP_FAILED y terminar en FAILED cuando una tool MCP falla")
+    void shouldPublishStepFailedWhenDomainServiceFails() throws InterruptedException {
+        when(chatModel.call(any(Prompt.class)))
+                .thenReturn(toolCallResponse("call-1", "get_vehicle_information"));
+
+        List<FlowExecutionEvent> events = new CopyOnWriteArrayList<>();
+        CountDownLatch failed = new CountDownLatch(1);
+        publisher.stream().subscribe(event -> {
+            events.add(event);
+            if ("FLOW_FAILED".equals(event.eventType())) {
+                failed.countDown();
+            }
+        });
+
+        FlowService service = buildService(fakeMcpToolClient(true), 3);
+        FlowResponse response = service.createFlow(request());
+
+        assertTrue(failed.await(5, TimeUnit.SECONDS), "Debe publicarse FLOW_FAILED");
+        assertEquals("FAILED", response.getStatus());
+        assertEquals("ERR_FLOW_01", response.getFlowCode());
+        assertNotNull(response.getUserErrorTitle());
+
+        FlowExecutionEvent stepFailed = events.stream()
+                .filter(event -> "STEP_FAILED".equals(event.eventType()))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("Debe publicarse STEP_FAILED"));
+        assertEquals("get_vehicle_information", stepFailed.toolName());
+        assertNotNull(stepFailed.errorMessage());
+        assertTrue(stepFailed.errorMessage().contains("MCP service unavailable"),
+                "STEP_FAILED debe conservar el error de la tool MCP");
+    }
+
+    @Test
+    @DisplayName("debe degradar de forma elegante cuando el LLM no responde")
+    void shouldDegradeGracefullyWhenLlmIsUnavailable() throws InterruptedException {
+        when(chatModel.call(any(Prompt.class)))
+                .thenThrow(new IllegalStateException("connection refused"));
+
+        List<FlowExecutionEvent> events = new CopyOnWriteArrayList<>();
+        CountDownLatch failed = new CountDownLatch(1);
+        publisher.stream().subscribe(event -> {
+            events.add(event);
+            if ("FLOW_FAILED".equals(event.eventType())) {
+                failed.countDown();
+            }
+        });
+
+        FlowService service = buildService(fakeMcpToolClient(false), 3);
+        FlowResponse response = service.createFlow(request());
+
+        assertTrue(failed.await(5, TimeUnit.SECONDS), "Debe publicarse FLOW_FAILED");
+        assertEquals("FAILED", response.getStatus());
+        assertEquals(AiService.FLOW_CODE_LLM_ERROR, response.getFlowCode());
+        assertTrue(response.getUserErrorMessage().contains("IA"));
+        assertEquals("warning", response.getUserErrorStatusType());
+
+        FlowExecutionEvent failedEvent = events.stream()
+                .filter(event -> "FLOW_FAILED".equals(event.eventType()))
+                .findFirst()
+                .orElseThrow();
+        assertEquals(AiService.FLOW_CODE_LLM_ERROR, failedEvent.flowCode());
+        assertFalse(failedEvent.userErrorMessage().isBlank());
+    }
+
+    private FlowRequest request() {
         FlowRequest request = new FlowRequest();
         request.setFlowId("compra-vehiculo");
         request.getAttributes().put("customerId", "customer-001");
         request.getAttributes().put("vehicleId", "vehicle-123");
         request.getAttributes().put("salesAgentId", "agent-77");
-
-        try {
-            var flow = service.createFlow(request);
-
-            assertTrue(latch.await(5, TimeUnit.SECONDS), "Esperando eventos SSE");
-            assertEquals("FAILED", flow.getStatus());
-            assertEquals("registrar_compra", flow.getCurrentStep());
-            assertNotNull(flow.getErrorMessage());
-
-            assertTrue(events.stream().anyMatch(e -> "STEP_FAILED".equals(e.eventType())
-                    && "register_vehicle_purchase".equals(e.toolName())
-                    && "purchase service failed".equals(e.errorMessage())));
-            assertTrue(events.stream().anyMatch(e -> "FLOW_FAILED".equals(e.eventType())));
-        } finally {
-            server.stop(0);
-        }
+        return request;
     }
 
-    private HttpServer startServer(
-            List<List<String>> offeredToolsPerTurn,
-            boolean failPurchase) throws IOException {
+    private FlowService buildService(McpToolClient registry, int maxAgentTurns) {
+        FlowServiceConfig config = new FlowServiceConfig(
+                baseUrl(controlCenter),
+                "http://localhost:11434",
+                "qwen2.5:7b",
+                maxAgentTurns,
+                0,
+                Duration.ofSeconds(5),
+                5,
+                Duration.ofSeconds(5),
+                20,
+                Duration.ofSeconds(2),
+                1,
+                Duration.ZERO,
+                50,
+                Duration.ofSeconds(30),
+                Duration.ofSeconds(5)
+        );
+        AiService aiService = new AiService(chatModel, config, new ObjectMapper(),
+                new PiiMasker(), circuitBreakerRegistry, retryRegistry);
+        return new FlowService(
+                WebClient.builder().build(),
+                aiService,
+                config,
+                new ObjectMapper(),
+                flowDefinitions,
+                registry,
+                publisher,
+                new FlowStateManager(),
+                new UserFacingErrorMapper(),
+                new PiiMasker(),
+                circuitBreakerRegistry,
+                retryRegistry
+        );
+    }
+
+    private FlowDefinitions buildFlowDefinitions() {
+        FlowDefinitions definitions = new FlowDefinitions();
+        FlowDefinitions.FlowDefinition flow = new FlowDefinitions.FlowDefinition();
+        flow.setProcessTemplateName("compra-vehiculo");
+        flow.setSystemPromptTemplate(
+                "inline:Eres un asistente especializado en <flowName>. Flujo: <flowId>.");
+        flow.setUserPromptTemplate(
+                "inline:Procesa el flujo <flowName> para el cliente <customerId>. "
+                        + "Vehículo: <vehicleId>");
+
+        FlowDefinitions.ToolDefinition t1 = tool("get_vehicle_information", 1,
+                "Consultar vehículo", List.of());
+        FlowDefinitions.ToolDefinition t2 = tool("register_vehicle_purchase", 2,
+                "Registrar compra", List.of("get_vehicle_information"));
+        FlowDefinitions.ToolDefinition t3 = tool("set_payment_method", 3,
+                "Configurar pago", List.of("register_vehicle_purchase"));
+        FlowDefinitions.ToolDefinition t4 = tool("send_purchase_status_email", 4,
+                "Enviar email", List.of("set_payment_method"));
+
+        flow.setTools(List.of(t1, t2, t3, t4));
+        definitions.getFlows().put("compra-vehiculo", flow);
+        definitions.getMcpServers().put("mcp-domain", "http://localhost:9001");
+        return definitions;
+    }
+
+    private FlowDefinitions.ToolDefinition tool(String name, int order, String stepName,
+                                                List<String> dependsOn) {
+        FlowDefinitions.ToolDefinition tool = new FlowDefinitions.ToolDefinition();
+        tool.setName(name);
+        tool.setServer("mcp-domain");
+        tool.setStepOrder(order);
+        tool.setStepName(stepName);
+        tool.setRequired(true);
+        tool.setDependsOn(dependsOn);
+        return tool;
+    }
+
+    private HttpServer startControlCenter() throws IOException {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        AtomicInteger chatCalls = new AtomicInteger();
-        server.createContext("/", exchange -> {
-            String path = exchange.getRequestURI().getPath();
-            String method = exchange.getRequestMethod();
-            if ("/api/chat".equals(path) && "POST".equals(method)) {
-                int call = chatCalls.getAndIncrement();
-                String chatRequest = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                offeredToolsPerTurn.add(extractToolNames(chatRequest));
-                List<String> tools = List.of(
-                        "get_vehicle_information",
-                        "register_vehicle_purchase",
-                        "set_payment_method",
-                        "send_purchase_status_email"
-                );
-                if (call == 0) {
-                    respond(exchange, 200, malformedToolCallResponse());
-                } else if (call - 1 < (failPurchase ? 2 : tools.size())) {
-                    respond(exchange, 200, toolCallResponse(tools.get(call - 1)));
-                } else {
-                    respond(exchange, 200, "{\"message\":{\"role\":\"assistant\",\"content\":\"Compra completada\"}}");
-                }
-            } else if ("/api/process-templates/by-name".equals(path) && "GET".equals(method)) {
-                respond(exchange, 200, "{\"id\":\"template-123\"}");
-            } else if ("/api/processes".equals(path) && "POST".equals(method)) {
-                respond(exchange, 201, "{\"id\":\"execution-123\",\"status\":\"PENDING\"}");
-            } else if (path.endsWith("/get_vehicle_information")) {
-                respond(exchange, 200, "{\"available\":true}");
-            } else if (path.endsWith("/register_vehicle_purchase") && failPurchase) {
-                respond(exchange, 500, "purchase service failed");
-            } else if (path.endsWith("/register_vehicle_purchase")) {
-                respond(exchange, 200, "{\"purchase_order_id\":\"purchase-123\"}");
-            } else if (path.endsWith("/set_payment_method")) {
-                respond(exchange, 200, "{\"status\":\"PAYMENT_CONFIGURED\"}");
-            } else if (path.endsWith("/purchase-status")) {
-                respond(exchange, 200, "{\"status\":\"EMAIL_QUEUED\"}");
-            } else {
-                respond(exchange, 404, "not found");
-            }
+        server.createContext("/api/process-templates/by-name", exchange -> {
+            String query = exchange.getRequestURI().getQuery();
+            String name = query != null && query.contains("name=") ? query.split("name=")[1] : "";
+            sendResponse(exchange, 200, "{\"id\": \"" + name + "-template-id\"}");
         });
+        server.createContext("/api/processes", exchange ->
+                sendResponse(exchange, 200, "{\"id\": \"execution-123\"}"));
         server.start();
         return server;
     }
 
-    private List<String> extractToolNames(String chatRequest) throws IOException {
-        JsonNode tools = new ObjectMapper().readTree(chatRequest).path("tools");
-        List<String> names = new java.util.ArrayList<>();
-        tools.forEach(tool -> names.add(tool.path("function").path("name").asText()));
-        return names;
+    private void sendResponse(HttpExchange exchange, int status, String body) throws IOException {
+        byte[] response = body.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().add("Content-Type", "application/json");
+        exchange.sendResponseHeaders(status, response.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(response);
+        }
     }
 
-    private String toolCallResponse(String name) {
-        String arguments = switch (name) {
-            case "get_vehicle_information" -> "{\"model_id\":\"vehicle-123\",\"agency_id\":\"agency-01\"}";
-            case "register_vehicle_purchase" -> "{\"customer_id\":\"customer-001\",\"vehicle_id\":\"vehicle-123\",\"sales_agent_id\":\"agent-77\"}";
-            case "set_payment_method" -> "{\"purchase_order_id\":\"purchase-123\",\"payment_type\":\"FINANCING\",\"financial_institution\":\"BBVA\",\"down_payment_amount\":15000}";
-            case "send_purchase_status_email" -> "{\"recipientEmail\":\"customer@example.com\",\"templateId\":\"ORDER_CREATED\",\"data\":{\"customer\":\"customer-001\",\"vehicle\":\"vehicle-123\",\"order\":\"purchase-123\"}}";
-            default -> "{}";
-        };
-        return "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{" +
-                "\"function\":{\"name\":\"" + name + "\",\"arguments\":" + arguments + "}}]}}";
-    }
-
-    private String malformedToolCallResponse() {
-        return "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{" +
-                "\"function\":{\"name\":\"get_vehicle_information\",\"arguments\":{" +
-                "\"type\":\"object\",\"properties\":{\"model_id\":{\"type\":\"string\"}}}}}]}}";
-    }
-
-    private String baseUrl(HttpServer server) {
-        return "http://127.0.0.1:" + server.getAddress().getPort();
-    }
-
-    private McpToolClient fakeMcpToolClient(boolean failPurchase) {
+    private McpToolClient fakeMcpToolClient(boolean failTools) {
         return new McpToolClient() {
             @Override
             public List<DiscoveredTool> listTools(String serverName) {
-                if ("mcp-domain".equals(serverName)) {
-                    return List.of(
-                            discoveredTool("get_vehicle_information", Map.of(
-                                    "model_id", stringSchema(), "agency_id", stringSchema()), List.of("model_id", "agency_id")),
-                            discoveredTool("register_vehicle_purchase", Map.of(
-                                    "customer_id", stringSchema(), "vehicle_id", stringSchema(),
-                                    "sales_agent_id", stringSchema()), List.of("customer_id", "vehicle_id", "sales_agent_id")),
-                            discoveredTool("set_payment_method", Map.of(
-                                    "purchase_order_id", stringSchema(), "payment_type", stringSchema(),
-                                    "financial_institution", stringSchema(), "down_payment_amount", Map.of("type", "number")),
-                                    List.of("purchase_order_id", "payment_type", "financial_institution", "down_payment_amount")));
-                }
-                return List.of(discoveredTool("send_purchase_status_email", Map.of(
-                        "recipientEmail", stringSchema(), "templateId", stringSchema(),
-                        "data", Map.of("type", "object")), List.of("recipientEmail", "templateId", "data")));
+                return List.of(
+                        discovered("get_vehicle_information"),
+                        discovered("register_vehicle_purchase"),
+                        discovered("set_payment_method"),
+                        discovered("send_purchase_status_email"));
             }
 
             @Override
-            public Map<String, Object> callTool(String serverName, String toolName, Map<String, Object> arguments) {
-                if (failPurchase && "register_vehicle_purchase".equals(toolName)) {
-                    throw new IllegalStateException("purchase service failed");
+            public Map<String, Object> callTool(String serverName, String toolName,
+                                                Map<String, Object> arguments) {
+                if (failTools) {
+                    throw new RuntimeException("MCP service unavailable");
                 }
-                return switch (toolName) {
-                    case "get_vehicle_information" -> Map.of("available", true);
-                    case "register_vehicle_purchase" -> Map.of("purchase_order_id", "purchase-123");
-                    case "set_payment_method" -> Map.of("status", "PAYMENT_CONFIGURED");
-                    case "send_purchase_status_email" -> Map.of("status", "SENT");
-                    default -> throw new IllegalArgumentException("Unexpected tool: " + toolName);
-                };
+                return Map.of("result", "ok", "tool", toolName);
             }
         };
     }
 
-    private DiscoveredTool discoveredTool(String name, Map<String, Object> properties, List<String> required) {
-        return new DiscoveredTool(name, name, Map.of(
-                "type", "object",
-                "properties", properties,
-                "required", required));
+    private DiscoveredTool discovered(String name) {
+        return new DiscoveredTool(name, "desc",
+                Map.of("type", "object", "properties", Map.of(), "required", List.of()));
     }
 
-    private Map<String, Object> stringSchema() {
-        return Map.of("type", "string");
+    private ChatResponse toolCallResponse(String callId, String toolName) {
+        return chatResponse("", List.of(
+                new AssistantMessage.ToolCall(callId, "function", toolName, "{}")));
     }
 
-    private void respond(HttpExchange exchange, int status, String body) throws IOException {
-        byte[] response = body.getBytes(StandardCharsets.UTF_8);
-        if (status != 204) {
-            exchange.getResponseHeaders().add("Content-Type", "application/json");
-        }
-        exchange.sendResponseHeaders(status, status == 204 ? -1 : response.length);
-        if (status != 204) {
-            exchange.getResponseBody().write(response);
-        }
-        exchange.close();
+    private ChatResponse textResponse(String content) {
+        return chatResponse(content, List.of());
+    }
+
+    private ChatResponse chatResponse(String content, List<AssistantMessage.ToolCall> toolCalls) {
+        AssistantMessage message = new AssistantMessage(content, Map.of(), toolCalls);
+        ChatResponseMetadata metadata = ChatResponseMetadata.builder()
+                .model("qwen2.5:7b")
+                .usage(new DefaultUsage(10, 5))
+                .build();
+        return new ChatResponse(List.of(new Generation(message)), metadata);
+    }
+
+    private String baseUrl(HttpServer server) {
+        InetSocketAddress address = server.getAddress();
+        return "http://" + address.getHostName() + ":" + address.getPort();
     }
 }

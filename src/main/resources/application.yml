@@ -9,16 +9,25 @@ spring:
       enabled: ALWAYS
   application:
     name: orchestrator
+  ai:
+    ollama:
+      base-url: ${ollama.base-url}
+      model: ${ollama.model}
+      chat:
+        options:
+          temperature: 0.0
+          top-p: 0.1
 
 logging:
   charset:
     console: UTF-8
   pattern:
-    console: "%clr(%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX}){faint} %clr(%-5level){level} %clr([%thread]){faint} %clr(%logger{36}){cyan} - %clr(%msg){level}%n%ex"
+    console: "%clr(%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX}){faint} %clr(%-5level){level} %clr([%thread]){faint} %clr(%logger{36}){cyan} %clr(traceId=%X{traceId}){faint} - %clr(%msg){level}%n%ex"
 
 services:
   control-center:
     base-url: http://localhost:8081
+    timeout-seconds: 10
   mcp-domain:
     base-url: http://localhost:9001
   mcp-notifications:
@@ -28,8 +37,56 @@ ollama:
   base-url: http://localhost:11434
   model: qwen2.5:7b
   max-agent-turns: 8
+  max-context-messages: 20
+  # qwen2.5:7b en local tarda 30-60s por turno; 60s provocaba timeouts en el límite.
+  timeout-seconds: 120
+  max-retries: 3
+  retry-wait-seconds: 2
+  circuit-breaker-threshold: 50
+  circuit-breaker-reset-seconds: 60
+
+mcp:
+  max-retries: 2
+  step-timeout-seconds: 30
+  circuit-breaker-threshold: 5
+  circuit-breaker-reset-seconds: 60
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      llm:
+        sliding-window-size: 20
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        # Una respuesta lenta (30-60s) es normal en Ollama local: solo se considera
+        # "slow call" por encima de 90s para no abrir el circuito por latencia habitual.
+        slow-call-rate-threshold: 80
+        slow-call-duration-threshold: 90s
+        wait-duration-in-open-state: 30s
+        register-health-indicator: true
+  retry:
+    instances:
+      llm:
+        max-attempts: 2
+        wait-duration: 2s
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        exponential-max-wait-duration: 10s
+        # Reintentar solo fallos transitorios de red/servicio. Los timeouts propios
+        # no se reintentan para no duplicar la latencia ya alta de cada turno.
+        retry-exceptions:
+          - org.springframework.web.client.ResourceAccessException
+          - org.springframework.ai.retry.TransientAiException
+          - java.io.IOException
+        ignore-exceptions:
+          - org.springframework.ai.retry.NonTransientAiException
+          - java.lang.IllegalArgumentException
 
 orchestrator:
+  state:
+    # Los estados pausados/fallidos se guardan aquí para sobrevivir reinicios.
+    # Vacío desactiva la persistencia.
+    directory: .flow-state
   mcp-servers:
     mcp-domain: ${services.mcp-domain.base-url}
     mcp-notifications: ${services.mcp-notifications.base-url}
@@ -38,7 +95,10 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,metrics,circuitbreakers,retries
+  health:
+    circuitbreakers:
+      enabled: true
 
 springdoc:
   api-docs:

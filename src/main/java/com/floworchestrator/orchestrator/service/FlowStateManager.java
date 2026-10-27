@@ -55,16 +55,16 @@ public class FlowStateManager {
 
     private Path initializeDirectory(String directory) {
         if (directory == null || directory.isBlank()) {
-            log.info("[STATE] Paused state persistence disabled");
+            log.info("[STATE] Persistencia de estados pausados deshabilitada");
             return null;
         }
         try {
             Path path = Path.of(directory).toAbsolutePath().normalize();
             Files.createDirectories(path);
-            log.info("[STATE] Paused flow state directory: {}", path);
+            log.info("[STATE] Directorio de estados de flujos pausados: {}", path);
             return path;
         } catch (IOException ex) {
-            log.error("[STATE] Could not create state directory '{}'; persistence disabled",
+            log.error("[STATE] No se pudo crear el directorio de estados '{}'; persistencia deshabilitada",
                     directory, ex);
             return null;
         }
@@ -145,7 +145,7 @@ public class FlowStateManager {
                 Files.deleteIfExists(tempFile);
             }
         } catch (IOException ex) {
-            log.error("[STATE] Could not persist paused state: executionId={}", executionId, ex);
+            log.error("[STATE] No se pudo persistir el estado pausado: executionId={}", executionId, ex);
         }
     }
 
@@ -169,15 +169,15 @@ public class FlowStateManager {
         try {
             PersistedFlowState snapshot = objectMapper.readValue(file.toFile(), PersistedFlowState.class);
             if (!executionId.equals(snapshot.executionId())) {
-                log.warn("[STATE] Ignoring state file with mismatched executionId: expected={}, found={}",
+                log.warn("[STATE] Se ignora el archivo de estado con executionId distinto: esperado={}, encontrado={}",
                         executionId, snapshot.executionId());
                 return null;
             }
-            log.info("[STATE] Paused state restored from disk: executionId={}, flowId={}",
+            log.info("[STATE] Estado pausado restaurado desde disco: executionId={}, flowId={}",
                     executionId, snapshot.flowId());
             return snapshot.toPausedState();
         } catch (IOException ex) {
-            log.error("[STATE] Corrupt paused state file, deleting it: executionId={}, error={}",
+            log.error("[STATE] Archivo de estado pausado corrupto; se elimina: executionId={}, error={}",
                     executionId, ex.getMessage());
             delete(executionId);
             return null;
@@ -191,7 +191,7 @@ public class FlowStateManager {
         try {
             Files.deleteIfExists(stateFile(executionId));
         } catch (IOException ex) {
-            log.warn("[STATE] Could not delete state file: executionId={}", executionId, ex);
+            log.warn("[STATE] No se pudo eliminar el archivo de estado: executionId={}", executionId, ex);
         }
     }
 
@@ -205,7 +205,7 @@ public class FlowStateManager {
                     .digest(value.getBytes(StandardCharsets.UTF_8));
             return HexFormat.of().formatHex(digest);
         } catch (NoSuchAlgorithmException ex) {
-            throw new IllegalStateException("SHA-256 is not available", ex);
+            throw new IllegalStateException("SHA-256 no está disponible", ex);
         }
     }
 

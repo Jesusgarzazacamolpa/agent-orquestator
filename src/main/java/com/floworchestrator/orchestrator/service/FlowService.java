@@ -134,7 +134,7 @@ public class FlowService {
             try {
                 withTraceId(traceId, id -> doCreateFlow(request, id));
             } catch (RuntimeException ex) {
-                log.error("[ASYNC] Flow could not be started: requestId={}, flowId={}, traceId={}, error={}",
+                log.error("[ASYNC] No se pudo iniciar el flujo: requestId={}, flowId={}, traceId={}, error={}",
                         requestId, request.getFlowId(), traceId, messageOf(ex), ex);
                 withTraceId(traceId, id -> {
                     flowEventPublisher.publish(FlowExecutionEvent.withUserAgentError(
@@ -147,7 +147,7 @@ public class FlowService {
                 });
             }
         });
-        log.info("[ASYNC] Flow accepted: requestId={}, flowId={}, executionId={}, traceId={}",
+        log.info("[ASYNC] Flujo aceptado: requestId={}, flowId={}, executionId={}, traceId={}",
                 requestId, request.getFlowId(), request.getExecutionId(), traceId);
         return FlowAsyncAccepted.accepted(requestId, request.getFlowId(),
                 request.getExecutionId(), traceId);
@@ -157,10 +157,10 @@ public class FlowService {
         Map.Entry<String, FlowDefinition> selectedFlow = selectFlow(request.getFlowId());
         String flowId = selectedFlow.getKey();
         FlowDefinition flow = selectedFlow.getValue();
-        log.info("[START] Starting flow: flowId={}, traceId={}", flowId, traceId);
+        log.info("[START] Iniciando flujo: flowId={}, traceId={}", flowId, traceId);
 
         String executionId = resolveExecutionId(flow, request);
-        log.info("[ID] Process execution created: flowId={}, executionId={}", flowId, executionId);
+        log.info("[ID] Ejecución del proceso creada: flowId={}, executionId={}", flowId, executionId);
         flowEventPublisher.publish(FlowExecutionEvent.of(executionId, flowId, "FLOW_STARTED"));
 
         FlowResponse response = new FlowResponse();
@@ -172,11 +172,11 @@ public class FlowService {
         List<Map<String, Object>> messages = buildPromptMessages(flow, request, flowId);
         AgentLoopState state = new AgentLoopState();
         try {
-            log.info("[AGENT] Entering agent loop: flowId={}, executionId={}, maxAgentTurns={}",
+            log.info("[AGENT] Entrando al bucle del agente: flowId={}, executionId={}, maxAgentTurns={}",
                     flowId, executionId, config.maxAgentTurns());
             boolean completed = runAgentLoop(flow, flowId, executionId, response, messages, state, traceId);
             if (!completed) {
-                throw new IllegalStateException("Agent exceeded the maximum number of turns");
+                throw new IllegalStateException("El agente superó el número máximo de turnos");
             }
         } catch (RuntimeException ex) {
             response = handleAgentLoopException(executionId, flowId, flow, messages, state, ex,
@@ -205,7 +205,7 @@ public class FlowService {
             userMessage.put("role", ROLE_USER);
             userMessage.put("content", userInput);
             messages.add(userMessage);
-            log.info("[RESUME] User input injected: executionId={}, inputLength={}",
+            log.info("[RESUME] Entrada del usuario inyectada: executionId={}, inputLength={}",
                     executionId, userInput.length());
         }
 
@@ -222,7 +222,7 @@ public class FlowService {
         try {
             boolean completed = runAgentLoop(flow, flowId, executionId, response, messages, state, traceId);
             if (!completed) {
-                throw new IllegalStateException("Agent exceeded the maximum number of turns");
+                throw new IllegalStateException("El agente superó el número máximo de turnos");
             }
         } catch (RuntimeException ex) {
             response = handleAgentLoopException(executionId, flowId, flow, messages, state, ex,
@@ -297,7 +297,7 @@ public class FlowService {
                     + "Proporciona los datos solicitados y reanuda el proceso.";
             String userActionLabel = "Reanudar proceso";
             String userStatusType = "info";
-            String logPrefix = isResume ? "[PAUSE] Flujo pausado nuevamente" : "[PAUSE] Flow paused";
+            String logPrefix = isResume ? "[PAUSE] Flujo pausado nuevamente" : "[PAUSE] Flujo pausado";
             log.warn("{}: executionId={}, step={}, reason={}",
                     logPrefix, executionId, state.currentStep, errorMessage);
             flowEventPublisher.publish(FlowExecutionEvent.withUserAgentError(
@@ -336,7 +336,7 @@ public class FlowService {
             response.setUserErrorStatusType("warning");
         } else {
             String errorMessage = messageOf(ex);
-            String logPrefix = isResume ? "[FAIL] Flujo falló al reanudar" : "[FAIL] Flow failed";
+            String logPrefix = isResume ? "[FAIL] Flujo falló al reanudar" : "[FAIL] El flujo falló";
             log.error("{}: executionId={}, step={}, errorType={}, message={}",
                     logPrefix, executionId, state.currentStep, ex.getClass().getSimpleName(), errorMessage);
             UserFacingErrorMapper.ErrorMapping userError =
@@ -380,7 +380,7 @@ public class FlowService {
                 .bodyToMono(Map.class)
                 .block(config.controlCenterTimeout());
         if (templateResponse == null || templateResponse.get("id") == null) {
-            throw new IllegalStateException("Control Center did not return an active process template ID");
+            throw new IllegalStateException("El Control Center no devolvió un ID de plantilla de proceso activa");
         }
 
         Map<String, Object> controlCenterRequest = new HashMap<>();
@@ -395,7 +395,7 @@ public class FlowService {
                 .bodyToMono(Map.class)
                 .block(config.controlCenterTimeout());
         if (controlCenterResponse == null || controlCenterResponse.get("id") == null) {
-            throw new IllegalStateException("Control Center did not return a process execution ID");
+            throw new IllegalStateException("El Control Center no devolvió un ID de ejecución del proceso");
         }
         return controlCenterResponse.get("id").toString();
     }
@@ -440,7 +440,7 @@ public class FlowService {
         trimmed.addAll(messages.subList(start, messages.size()));
         messages.clear();
         messages.addAll(trimmed);
-        log.info("[CONTEXT] Context window trimmed: kept={} messages (max={})",
+        log.info("[CONTEXT] Ventana de contexto recortada: se conservaron {} mensajes (máx. {})",
                 messages.size(), config.maxContextMessages());
     }
 
@@ -448,12 +448,12 @@ public class FlowService {
                                  FlowResponse response, List<Map<String, Object>> messages,
                                  AgentLoopState state, String traceId) {
         for (int turn = 0; turn < config.maxAgentTurns(); turn++) {
-            log.info("[AGENT] Turn {}/{} starting: flowId={}, executionId={}",
+            log.info("[AGENT] Iniciando turno {}/{}: flowId={}, executionId={}",
                     turn + 1, config.maxAgentTurns(), flowId, executionId);
             trimContextIfNeeded(messages);
 
             List<ToolSpec> toolSpecs = getToolSpecs(flow, state);
-            log.info("[TOOLS] Offering {} tools to LLM: flowId={}, executionId={}, tools={}",
+            log.info("[TOOLS] Ofreciendo {} herramientas al LLM: flowId={}, executionId={}, tools={}",
                     toolSpecs.size(), flowId, executionId,
                     toolSpecs.stream().map(ToolSpec::name).toList());
 
@@ -463,20 +463,21 @@ public class FlowService {
                 // final (resumen) no debe marcar el flujo como fallido.
                 if (state.completedTools.containsAll(getRequiredTools(flow))) {
                     String fallbackMessage = completionFallbackMessage(flow, state.completedTools);
-                    log.warn("[AI-DEGRADED] LLM unavailable after all required steps completed; "
-                                    + "closing flow with fallback summary: flowId={}, executionId={}",
+                    log.warn("[AI-DEGRADED] LLM no disponible después de completar todos los pasos "
+                                    + "obligatorios; se cierra el flujo con un resumen de respaldo: "
+                                    + "flowId={}, executionId={}",
                             flowId, executionId);
                     completeFlow(flow, flowId, executionId, response, fallbackMessage,
                             state.completedTools);
                     return true;
                 }
                 throw new LlmUnavailableException(
-                        "LLM unavailable for flow " + flowId,
+                        "LLM no disponible para el flujo " + flowId,
                         aiResponse.flowCode(), aiResponse.userMessage(), aiResponse.userAction());
             }
 
             String content = aiResponse.content();
-            log.info("[AI] Ollama response received: flowId={}, executionId={}, content={}",
+            log.info("[AI] Respuesta de Ollama recibida: flowId={}, executionId={}, content={}",
                     flowId, executionId, piiMasker.mask(content));
 
             List<AiToolCall> toolCalls = aiResponse.toolCalls();
@@ -487,7 +488,7 @@ public class FlowService {
 
             if (toolCalls.isEmpty()) {
                 if (isRequestingUserInput(content)) {
-                    log.info("[USER_INPUT] LLM requesting user input: flowId={}, executionId={}",
+                    log.info("[USER_INPUT] El LLM solicita información al usuario: flowId={}, executionId={}",
                             flowId, executionId);
                     throw new RequiresHumanInterventionException(
                             "El agente necesita información adicional del usuario para continuar: " + content);
@@ -532,10 +533,10 @@ public class FlowService {
                               FlowResponse response, String content, Set<String> completedTools) {
         Set<String> requiredTools = getRequiredTools(flow);
         if (!completedTools.containsAll(requiredTools)) {
-            throw new IllegalStateException("Agent finished before completing all required tools: "
+            throw new IllegalStateException("El agente terminó antes de completar todas las herramientas obligatorias: "
                     + difference(requiredTools, completedTools));
         }
-        log.info("[DONE] Flow completed: flowId={}, executionId={}", flowId, executionId);
+        log.info("[DONE] Flujo completado: flowId={}, executionId={}", flowId, executionId);
         flowEventPublisher.publish(FlowExecutionEvent.withError(
                 executionId, flowId, "FLOW_COMPLETED", null, null, null, null,
                 "COMPLETED", null));
@@ -548,13 +549,13 @@ public class FlowService {
                                   List<AiToolCall> toolCalls) {
         for (AiToolCall toolCall : toolCalls) {
             String toolName = toolCall.name();
-            log.info("[TOOLS] Processing tool call: flowId={}, executionId={}, toolName={}, toolCallId={}",
+            log.info("[TOOLS] Procesando llamada a herramienta: flowId={}, executionId={}, toolName={}, toolCallId={}",
                     flowId, executionId, toolName, toolCall.id());
             ToolDefinition tool;
             try {
                 tool = findTool(flow, toolName);
             } catch (IllegalArgumentException ex) {
-                log.warn("[BLOCKED] Agent requested a tool not allowed by the flow: "
+                log.warn("[BLOCKED] El agente solicitó una herramienta no permitida por el flujo: "
                                 + "flowId={}, executionId={}, tool={}",
                         flowId, executionId, toolName);
                 addToolErrorMessage(messages, toolName, toolCall.id(), ex.getMessage());
@@ -569,7 +570,7 @@ public class FlowService {
             try {
                 validateToolCall(tool, toolCall.arguments(), state);
             } catch (IllegalArgumentException ex) {
-                log.warn("[RETRY] Agent tool call rejected: flowId={}, executionId={}, tool={}, reason={}",
+                log.warn("[RETRY] Llamada a herramienta del agente rechazada: flowId={}, executionId={}, tool={}, reason={}",
                         flowId, executionId, toolName, ex.getMessage());
                 addToolErrorMessage(messages, toolName, toolCall.id(), ex.getMessage());
                 UserFacingErrorMapper.ErrorMapping userError =
@@ -607,7 +608,7 @@ public class FlowService {
                                     List<Map<String, Object>> messages, AgentLoopState state,
                                     ToolDefinition tool, AiToolCall toolCall) {
         String toolName = tool.getName();
-        log.info("[CALL] Agent requested MCP tool: flowId={}, executionId={}, server={}, tool={}, step={}",
+        log.info("[CALL] El agente solicitó la herramienta MCP: flowId={}, executionId={}, server={}, tool={}, step={}",
                 flowId, executionId, tool.getServer(), toolName, state.currentStep);
         long toolStartedAt = System.nanoTime();
         try {
@@ -620,7 +621,7 @@ public class FlowService {
             flowEventPublisher.publish(FlowExecutionEvent.withError(
                     executionId, flowId, "STEP_COMPLETED", state.currentStepOrder, state.currentStep,
                     toolName, tool.getServer(), "COMPLETED", null));
-            log.info("[OK] MCP tool completed: flowId={}, executionId={}, tool={}, durationMs={}",
+            log.info("[OK] Herramienta MCP completada: flowId={}, executionId={}, tool={}, durationMs={}",
                     flowId, executionId, toolName,
                     (System.nanoTime() - toolStartedAt) / 1_000_000);
             return true;
@@ -636,7 +637,7 @@ public class FlowService {
             throw ex;
         } catch (RuntimeException ex) {
             String toolError = messageOf(ex);
-            log.warn("[FAIL] MCP tool failed, adding error to context for agent retry: "
+            log.warn("[FAIL] Falló la herramienta MCP; se agrega el error al contexto para que el agente reintente: "
                             + "flowId={}, executionId={}, tool={}, error={}",
                     flowId, executionId, toolName, toolError);
             addToolErrorMessage(messages, toolName, toolCall.id(), toolError);
@@ -700,14 +701,14 @@ public class FlowService {
         List<DiscoveredTool> discoveredTools = state.discoveredByServer.computeIfAbsent(
                 server, serverName -> {
                     List<DiscoveredTool> tools = mcpClientRegistry.listTools(serverName);
-                    log.info("[DISCOVER] MCP tools discovered: server={}, tools={}", serverName,
+                    log.info("[DISCOVER] Herramientas MCP descubiertas: server={}, tools={}", serverName,
                             tools.stream().map(DiscoveredTool::name).toList());
                     return tools;
                 });
         return discoveredTools.stream()
                 .filter(candidate -> candidate.name().equals(toolName))
                 .findFirst()
-                .orElseThrow(() -> new IllegalStateException("MCP tool is not available: " + toolName));
+                .orElseThrow(() -> new IllegalStateException("La herramienta MCP no está disponible: " + toolName));
     }
 
     private Set<String> getRequiredTools(FlowDefinition flow) {
@@ -722,7 +723,7 @@ public class FlowService {
                                   AgentLoopState state) {
         for (String dependency : tool.getDependsOn()) {
             if (!state.completedTools.contains(dependency)) {
-                throw new IllegalArgumentException("Required tool has not completed: " + dependency);
+                throw new IllegalArgumentException("La herramienta obligatoria no se ha completado: " + dependency);
             }
         }
         DiscoveredTool discoveredTool = discoverTool(tool.getServer(), tool.getName(), state);
@@ -741,7 +742,7 @@ public class FlowService {
             try {
                 return callToolWithTimeout(tool, arguments);
             } catch (TimeoutException e) {
-                throw new IllegalStateException("MCP tool timeout: " + tool.getName(), e);
+                throw new IllegalStateException("Tiempo de espera agotado en la herramienta MCP: " + tool.getName(), e);
             }
         };
 
@@ -785,13 +786,13 @@ public class FlowService {
             throw ex;
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while calling MCP tool: " + tool.getName(), ex);
+            throw new IllegalStateException("Interrumpido durante la llamada a la herramienta MCP: " + tool.getName(), ex);
         } catch (ExecutionException ex) {
             Throwable cause = ex.getCause();
             if (cause instanceof RuntimeException runtimeException) {
                 throw runtimeException;
             }
-            throw new IllegalStateException("MCP tool failed: " + tool.getName(), cause);
+            throw new IllegalStateException("Falló la herramienta MCP: " + tool.getName(), cause);
         }
     }
 
@@ -849,7 +850,7 @@ public class FlowService {
         for (String argument : arguments.keySet()) {
             if (!properties.containsKey(argument)) {
                 throw new IllegalArgumentException(
-                        "Argument is not allowed for MCP tool " + tool.name() + ": " + argument
+                        "El argumento no está permitido para la herramienta MCP " + tool.name() + ": " + argument
                                 + ". Allowed arguments: " + allowedArguments);
             }
         }
@@ -858,7 +859,7 @@ public class FlowService {
             for (Object argument : required) {
                 if (arguments.get(String.valueOf(argument)) == null) {
                     throw new IllegalArgumentException(
-                            "Missing argument for MCP tool " + tool.name() + ": " + argument
+                            "Falta el argumento para la herramienta MCP " + tool.name() + ": " + argument
                                     + ". Allowed arguments: " + allowedArguments);
                 }
             }
@@ -867,7 +868,7 @@ public class FlowService {
 
     private Map.Entry<String, FlowDefinition> selectFlow(String requestedFlowId) {
         if (requestedFlowId == null || requestedFlowId.isBlank()) {
-            throw new IllegalArgumentException("flowId is required");
+            throw new IllegalArgumentException("El flowId es obligatorio");
         }
         String normalizedFlowId = requestedFlowId.trim();
         Map.Entry<String, FlowDefinition> selectedFlow = flowDefinitions.getFlows().entrySet().stream()
@@ -875,7 +876,7 @@ public class FlowService {
                         || entry.getValue().getProcessTemplateName().equalsIgnoreCase(normalizedFlowId))
                 .findFirst()
                 .orElseThrow(() -> new IllegalArgumentException(
-                        "Unknown flowId or process template name: " + requestedFlowId
+                        "flowId o nombre de plantilla de proceso desconocido: " + requestedFlowId
                                 + ". Available flowIds: " + flowDefinitions.getFlows().keySet()));
         validateFlow(selectedFlow.getValue());
         return selectedFlow;
@@ -886,7 +887,7 @@ public class FlowService {
                 || flow.getSystemPromptTemplate() == null || flow.getSystemPromptTemplate().isBlank()
                 || flow.getUserPromptTemplate() == null || flow.getUserPromptTemplate().isBlank()
                 || flow.getTools().isEmpty()) {
-            throw new IllegalStateException("Flow configuration is incomplete");
+            throw new IllegalStateException("La configuración del flujo está incompleta");
         }
         Set<String> ids = new HashSet<>();
         Set<Integer> stepOrders = new HashSet<>();
@@ -895,7 +896,7 @@ public class FlowService {
                     || tool.getServer() == null || !flowDefinitions.getMcpServers().containsKey(tool.getServer())
                     || tool.getStepOrder() < 1 || !stepOrders.add(tool.getStepOrder())
                     || tool.getStepName() == null || tool.getStepName().isBlank()) {
-                throw new IllegalStateException("Invalid or duplicate MCP tool configuration in flow");
+                throw new IllegalStateException("Configuración de herramienta MCP inválida o duplicada en el flujo");
             }
         }
     }
@@ -904,7 +905,7 @@ public class FlowService {
         return flow.getTools().stream()
                 .filter(tool -> tool.getName().equals(id))
                 .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("Tool is not allowed in this flow: " + id));
+                .orElseThrow(() -> new IllegalArgumentException("La herramienta no está permitida en este flujo: " + id));
     }
 
     private Set<String> difference(Set<String> required, Set<String> completed) {
@@ -920,7 +921,7 @@ public class FlowService {
             return result;
         }
 
-        log.debug("[PARSE] Attempting to parse tool calls from content: flowId={}, content={}",
+        log.debug("[PARSE] Intentando extraer llamadas a herramientas del contenido: flowId={}, content={}",
                 flowId, content);
 
         Pattern pattern = Pattern.compile("\\{[^{}]*\"name\"\\s*:\\s*\"[^\"]+\"[^{}]*\\}");
@@ -937,7 +938,7 @@ public class FlowService {
                 boolean allowed = flow.getTools().stream()
                         .anyMatch(tool -> tool.getName().equals(toolName));
                 if (!allowed) {
-                    log.warn("[PARSE] Tool call parsed but not allowed in flow: tool={}, allowed={}",
+                    log.warn("[PARSE] Llamada a herramienta detectada pero no permitida en el flujo: tool={}, allowed={}",
                             toolName, flow.getTools().stream().map(ToolDefinition::getName).toList());
                     continue;
                 }
@@ -945,14 +946,14 @@ public class FlowService {
                         ? parsed.get("parameters")
                         : parsed.get("arguments"));
                 result.add(new AiToolCall("call_" + UUID.randomUUID(), toolName, arguments));
-                log.info("[PARSE] Tool call parsed from content: flowId={}, executionId={}, tool={}, arguments={}",
+                log.info("[PARSE] Llamada a herramienta extraída del contenido: flowId={}, executionId={}, tool={}, arguments={}",
                         flowId, executionId, toolName, arguments);
             } catch (JsonProcessingException ex) {
-                log.warn("[PARSE] Failed to parse JSON fragment: {}, error={}",
+                log.warn("[PARSE] No se pudo analizar el fragmento JSON: {}, error={}",
                         jsonFragment, ex.getOriginalMessage());
             }
         }
-        log.info("[PARSE] Parsing complete: found={} valid tool calls", result.size());
+        log.info("[PARSE] Análisis completado: se encontraron {} llamadas a herramientas válidas", result.size());
         return result;
     }
 
@@ -986,7 +987,7 @@ public class FlowService {
             model.forEach(template::add);
             return template.render();
         } catch (IOException ex) {
-            throw new IllegalStateException("Could not load prompt template: " + templatePath, ex);
+            throw new IllegalStateException("No se pudo cargar la plantilla de prompt: " + templatePath, ex);
         }
     }
 
@@ -1003,7 +1004,7 @@ public class FlowService {
         try {
             return objectMapper.writeValueAsString(value);
         } catch (JsonProcessingException ex) {
-            throw new IllegalStateException("Could not serialize tool result", ex);
+            throw new IllegalStateException("No se pudo serializar el resultado de la herramienta", ex);
         }
     }
 

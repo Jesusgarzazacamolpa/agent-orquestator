@@ -27,7 +27,7 @@ public class FlowEventPublisher {
     public void publish(FlowExecutionEvent event) {
         Sinks.EmitResult result = sink.tryEmitNext(event);
         if (result.isFailure()) {
-            log.warn("[SSE] Failed to publish event: type={}, executionId={}, result={}",
+            log.warn("[SSE] No se pudo publicar el evento: type={}, executionId={}, result={}",
                     event.eventType(), event.executionId(), result);
         }
     }

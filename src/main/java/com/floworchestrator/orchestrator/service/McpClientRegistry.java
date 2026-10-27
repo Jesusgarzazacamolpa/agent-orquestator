@@ -46,7 +46,7 @@ public class McpClientRegistry implements McpToolClient {
                             .arguments(arguments)
                             .build());
             if (Boolean.TRUE.equals(result.isError())) {
-                throw new IllegalStateException("MCP tool failed: " + textContent(result));
+                throw new IllegalStateException("Falló la herramienta MCP: " + textContent(result));
             }
             return parseResult(textContent(result));
         });
@@ -56,7 +56,7 @@ public class McpClientRegistry implements McpToolClient {
         try {
             return operation.apply(client(serverName));
         } catch (RuntimeException ex) {
-            log.warn("[MCP] Session invalidated for '{}', recreating client and retrying: {}", serverName, ex.getMessage());
+            log.warn("[MCP] Sesión invalidada para '{}'; se recrea el cliente y se reintenta: {}", serverName, ex.getMessage());
             invalidateClient(serverName);
             return operation.apply(client(serverName));
         }
@@ -68,7 +68,7 @@ public class McpClientRegistry implements McpToolClient {
             try {
                 staleClient.closeGracefully();
             } catch (Exception e) {
-                log.warn("[MCP] Failed to close stale client for '{}': {}", serverName, e.getMessage());
+                log.warn("[MCP] No se pudo cerrar el cliente obsoleto de '{}': {}", serverName, e.getMessage());
             }
         }
     }
@@ -80,16 +80,16 @@ public class McpClientRegistry implements McpToolClient {
     private McpSyncClient createClient(String serverName) {
         String baseUrl = flowDefinitions.getMcpServers().get(serverName);
         if (baseUrl == null || baseUrl.isBlank()) {
-            throw new IllegalArgumentException("MCP server URL is not configured: " + serverName);
+            throw new IllegalArgumentException("La URL del servidor MCP no está configurada: " + serverName);
         }
-        log.info("[MCP] Creating client for '{}': baseUrl={}", serverName, baseUrl);
+        log.info("[MCP] Creando cliente para '{}': baseUrl={}", serverName, baseUrl);
         HttpClientStreamableHttpTransport transport = HttpClientStreamableHttpTransport
                 .builder(baseUrl)
                 .endpoint("/mcp")
                 .build();
         McpSyncClient client = McpClient.sync(transport).build();
         client.initialize();
-        log.info("[MCP] Client initialized for '{}'", serverName);
+        log.info("[MCP] Cliente inicializado para '{}'", serverName);
         return client;
     }
 
@@ -118,7 +118,7 @@ public class McpClientRegistry implements McpToolClient {
             try {
                 client.closeGracefully();
             } catch (Exception e) {
-                log.warn("[MCP] Error closing client during shutdown: {}", e.getMessage());
+                log.warn("[MCP] Error al cerrar el cliente durante el apagado: {}", e.getMessage());
             }
         });
         clients.clear();

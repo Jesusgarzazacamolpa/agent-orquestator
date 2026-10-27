@@ -10,7 +10,7 @@ import java.util.Map;
 
 @Data
 public class FlowRequest {
-    @NotBlank(message = "flowId is required")
+    @NotBlank(message = "El flowId es obligatorio.")
     private String flowId;
     private String executionId;
 

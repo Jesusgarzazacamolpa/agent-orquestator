@@ -42,7 +42,7 @@ public class FlowController {
             FlowResponse response = flowService.resumeFlow(executionId, userInput);
             return ResponseEntity.ok(response);
         } catch (IllegalStateException ex) {
-            log.warn("[RESUME] No paused state found for execution, returning 404: executionId={}", executionId);
+            log.warn("[RESUME] No se encontró estado pausado para la ejecución; se devuelve 404: executionId={}", executionId);
             return ResponseEntity.notFound().build();
         }
     }
@@ -59,11 +59,11 @@ public class FlowController {
             FlowResponse response = flowService.retryStep(executionId, stepOrder);
             return ResponseEntity.ok(response);
         } catch (IllegalStateException ex) {
-            log.warn("[RETRY-STEP] Cannot retry step: executionId={}, step={}, error={}",
+            log.warn("[RETRY-STEP] No se puede reintentar el paso: executionId={}, step={}, error={}",
                     executionId, stepOrder, ex.getMessage());
             return ResponseEntity.notFound().build();
         } catch (IllegalArgumentException ex) {
-            log.warn("[RETRY-STEP] Invalid retry request: executionId={}, step={}, error={}",
+            log.warn("[RETRY-STEP] Solicitud de reintento inválida: executionId={}, step={}, error={}",
                     executionId, stepOrder, ex.getMessage());
             return ResponseEntity.badRequest().build();
         }

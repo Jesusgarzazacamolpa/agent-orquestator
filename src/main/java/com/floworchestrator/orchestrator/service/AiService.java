@@ -109,7 +109,7 @@ public class AiService {
         }
 
         Throwable cause = result.getCause();
-        log.error("[AI-FAIL] LLM call failed: traceId={}, flowId={}, circuitState={}, error={}",
+        log.error("[AI-FAIL] Falló la llamada al LLM: traceId={}, flowId={}, circuitState={}, error={}",
                 traceId, flowId, circuitBreaker.getState(), describeCause(cause));
         return AiResponse.degraded(FLOW_CODE_LLM_ERROR, DEFAULT_USER_MESSAGE, DEFAULT_USER_ACTION);
     }
@@ -125,7 +125,7 @@ public class AiService {
                 .toList();
         TokenUsage usage = auditTokens(response, flowId, traceId);
 
-        log.info("[AI] LLM response: traceId={}, flowId={}, model={}, toolCalls={}, "
+        log.info("[AI] Respuesta del LLM: traceId={}, flowId={}, model={}, toolCalls={}, "
                         + "promptTokens={}, generationTokens={}, durationMs={}, content={}",
                 traceId, flowId, config.ollamaModel(), toolCalls.size(),
                 usage.promptTokens(), usage.generationTokens(),
@@ -154,22 +154,22 @@ public class AiService {
         } catch (TimeoutException ex) {
             future.cancel(true);
             throw new IllegalStateException(
-                    "LLM call timed out after " + config.llmTimeout().toSeconds() + "s", ex);
+                    "La llamada al LLM agotó el tiempo de espera tras " + config.llmTimeout().toSeconds() + "s", ex);
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("LLM call was interrupted", ex);
+            throw new IllegalStateException("La llamada al LLM fue interrumpida", ex);
         } catch (ExecutionException ex) {
             Throwable cause = ex.getCause();
             if (cause instanceof RuntimeException runtimeException) {
                 throw runtimeException;
             }
-            throw new IllegalStateException("LLM call failed", cause);
+            throw new IllegalStateException("La llamada al LLM falló", cause);
         }
     }
 
     private AssistantMessage requireOutput(ChatResponse response) {
         if (response == null || response.getResult() == null || response.getResult().getOutput() == null) {
-            throw new IllegalStateException("LLM returned an empty response");
+            throw new IllegalStateException("El LLM devolvió una respuesta vacía");
         }
         return response.getResult().getOutput();
     }
@@ -235,9 +235,9 @@ public class AiService {
                 map.forEach((key, value) -> arguments.put(String.valueOf(key), value));
                 return arguments;
             }
-            log.warn("[AI] Tool call arguments are not a JSON object: tool={}", toolName);
+            log.warn("[AI] Los argumentos de la llamada a herramienta no son un objeto JSON: tool={}", toolName);
         } catch (JsonProcessingException ex) {
-            log.warn("[AI] Malformed JSON arguments for tool {}: {}", toolName, ex.getOriginalMessage());
+            log.warn("[AI] Argumentos JSON malformados para la herramienta {}: {}", toolName, ex.getOriginalMessage());
         }
         // Se devuelven argumentos vacíos para que la validación del orquestador
         // devuelva el error al modelo y este pueda corregir la llamada.
@@ -270,7 +270,7 @@ public class AiService {
             @Override
             public String call(String input) {
                 throw new IllegalStateException(
-                        "MCP tools must be executed by the orchestrator, not by the chat model");
+                        "Las herramientas MCP debe ejecutarlas el orquestador, no el modelo de chat");
             }
         };
     }
@@ -316,7 +316,7 @@ public class AiService {
         try {
             return objectMapper.writeValueAsString(value);
         } catch (JsonProcessingException ex) {
-            log.warn("[AI] Could not serialize tool arguments: {}", ex.getOriginalMessage());
+            log.warn("[AI] No se pudieron serializar los argumentos de la herramienta: {}", ex.getOriginalMessage());
             return "{}";
         }
     }
@@ -336,7 +336,7 @@ public class AiService {
 
     private String describeCause(Throwable cause) {
         if (cause == null) {
-            return "Unknown error";
+            return "Error desconocido";
         }
         String message = cause.getMessage();
         return cause.getClass().getSimpleName() + (message == null ? "" : ": " + message);

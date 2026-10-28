@@ -65,6 +65,10 @@ public class OrchestratorConfiguration {
             RestClient.Builder restClientBuilder,
             @Value("${ollama.base-url:http://localhost:11434}") String ollamaBaseUrl,
             @Value("${ollama.model:qwen2.5:7b}") String ollamaModel,
+            @Value("${ollama.temperature:0.0}") double temperature,
+            @Value("${ollama.top-p:0.1}") double topP,
+            @Value("${ollama.keep-alive:30m}") String keepAlive,
+            @Value("${ollama.num-predict:256}") int numPredict,
             @Value("${ollama.timeout-seconds:120}") long llmTimeoutSeconds) {
         // El timeout del socket debe cortar la llamada HTTP real; cancelar el Future
         // del executor no interrumpe la petición en curso.
@@ -78,8 +82,10 @@ public class OrchestratorConfiguration {
                 .build();
         OllamaOptions defaultOptions = OllamaOptions.builder()
                 .model(ollamaModel)
-                .temperature(0.0)
-                .topP(0.1)
+                .temperature(temperature)
+                .topP(topP)
+                .keepAlive(keepAlive)
+                .numPredict(numPredict)
                 .build();
         return OllamaChatModel.builder()
                 .ollamaApi(ollamaApi)

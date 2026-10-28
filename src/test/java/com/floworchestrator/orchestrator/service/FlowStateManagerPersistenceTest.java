@@ -49,6 +49,7 @@ class FlowStateManagerPersistenceTest {
 
         FlowStateManager.AgentStateSnapshot agentState = restored.agentState().snapshot();
         assertEquals(Set.of("get_vehicle_information"), agentState.completedTools());
+        assertEquals(Set.of("set_payment_method"), agentState.failedTools());
         assertEquals(3, agentState.currentStepOrder());
         assertEquals("Configurar pago", agentState.currentStep());
         assertEquals("ok", agentState.toolResults().get("get_vehicle_information").get("result"));
@@ -117,6 +118,7 @@ class FlowStateManagerPersistenceTest {
         FlowService.AgentLoopState agentState = FlowService.AgentLoopState.fromSnapshot(
                 new FlowStateManager.AgentStateSnapshot(
                         Set.of("get_vehicle_information"),
+                        Set.of("set_payment_method"),
                         Map.of("get_vehicle_information", Map.of("result", "ok")),
                         3,
                         "Configurar pago"));

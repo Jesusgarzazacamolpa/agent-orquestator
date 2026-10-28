@@ -219,6 +219,7 @@ public class FlowStateManager {
 
     public record AgentStateSnapshot(
             Set<String> completedTools,
+            Set<String> failedTools,
             Map<String, Map<String, Object>> toolResults,
             int currentStepOrder,
             String currentStep
@@ -250,7 +251,7 @@ public class FlowStateManager {
                     messages == null ? List.of() : messages,
                     FlowService.AgentLoopState.fromSnapshot(
                             agentState == null
-                                    ? new AgentStateSnapshot(Set.of(), Map.of(), 0, null)
+                                    ? new AgentStateSnapshot(Set.of(), Set.of(), Map.of(), 0, null)
                                     : agentState));
         }
     }

@@ -9,14 +9,6 @@ spring:
       enabled: ALWAYS
   application:
     name: orchestrator
-  ai:
-    ollama:
-      base-url: ${ollama.base-url}
-      model: ${ollama.model}
-      chat:
-        options:
-          temperature: 0.0
-          top-p: 0.1
 
 logging:
   charset:
@@ -36,10 +28,19 @@ services:
 ollama:
   base-url: http://localhost:11434
   model: qwen2.5:7b
+  temperature: 0.0
+  top-p: 0.1
+  # Ollama descarga el modelo tras 5 min de inactividad por defecto. Como el flujo
+  # se pausa para pedir datos al usuario, cada pausa obligaba a recargar los ~4.7 GB
+  # y el turno siguiente superaba el timeout. Usa -1 para no descargarlo nunca.
+  keep-alive: 30m
+  # Techo de tokens generados por turno: en CPU una respuesta larga supera los 180s.
+  num-predict: 256
   max-agent-turns: 8
   max-context-messages: 20
-  # qwen2.5:7b en local tarda 30-60s por turno; 60s provocaba timeouts en el límite.
-  timeout-seconds: 120
+  # qwen2.5:7b en local tarda 30-60s por turno y más si el modelo está frío tras
+  # horas inactivo; 120s provocaba ERR_LLM_01 justo al reanudar por la mañana.
+  timeout-seconds: 180
   max-retries: 3
   retry-wait-seconds: 2
   circuit-breaker-threshold: 50

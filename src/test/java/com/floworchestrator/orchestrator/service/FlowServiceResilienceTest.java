@@ -21,6 +21,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -48,6 +49,7 @@ class FlowServiceResilienceTest {
     private FlowEventPublisher publisher;
     private AtomicInteger mcpCallCount;
     private boolean mcpShouldFail;
+    private RuntimeException mcpFailure;
     private FlowDefinitions flowDefinitions;
     private CircuitBreakerRegistry circuitBreakerRegistry;
     private RetryRegistry retryRegistry;
@@ -60,6 +62,7 @@ class FlowServiceResilienceTest {
         publisher = new FlowEventPublisher();
         mcpCallCount = new AtomicInteger(0);
         mcpShouldFail = false;
+        mcpFailure = null;
         chatModel = mock(ChatModel.class);
         circuitBreakerRegistry = CircuitBreakerRegistry.ofDefaults();
         retryRegistry = RetryRegistry.of(RetryConfig.custom()
@@ -136,6 +139,9 @@ class FlowServiceResilienceTest {
             public Map<String, Object> callTool(String serverName, String toolName,
                                                 Map<String, Object> arguments) {
                 int callNum = mcpCallCount.incrementAndGet();
+                if (mcpFailure != null) {
+                    throw mcpFailure;
+                }
                 if (mcpShouldFail) {
                     throw new RuntimeException("MCP service unavailable");
                 }
@@ -185,6 +191,117 @@ class FlowServiceResilienceTest {
         }
 
         assertEquals(3, mcpCallCount.get(), "Debe llamar 3 veces (inicial + 2 reintentos)");
+    }
+
+    @Test
+    @DisplayName("no debe repetir un error de herramienta no reintentable")
+    @Timeout(15)
+    void shouldNotRetryNonRetryableToolError() throws Exception {
+        mcpFailure = new McpToolException("Falló la herramienta MCP: ALREADY_EXISTS",
+                "ALREADY_EXISTS", false);
+
+        Method method = FlowService.class.getDeclaredMethod("executeToolWithRetry",
+                FlowDefinitions.ToolDefinition.class, Map.class);
+        method.setAccessible(true);
+
+        FlowDefinitions.ToolDefinition tool = tool("register_vehicle_purchase", 2, "Registrar compra", List.of());
+
+        try {
+            method.invoke(service, tool, Map.of());
+            fail("Debe propagar el error de negocio");
+        } catch (InvocationTargetException e) {
+            assertInstanceOf(McpToolException.class, e.getCause());
+            assertFalse(((McpToolException) e.getCause()).isRetryable());
+        }
+
+        assertEquals(1, mcpCallCount.get(),
+                "Un error de negocio no reintentable debe llamar una sola vez");
+    }
+
+    @Test
+    @DisplayName("debe reintentar un error de herramienta marcado como reintentable")
+    @Timeout(20)
+    void shouldRetryRetryableToolError() throws Exception {
+        mcpFailure = new McpToolException("Falló la herramienta MCP: DEPENDENCY_UNAVAILABLE",
+                "DEPENDENCY_UNAVAILABLE", true);
+
+        Method method = FlowService.class.getDeclaredMethod("executeToolWithRetry",
+                FlowDefinitions.ToolDefinition.class, Map.class);
+        method.setAccessible(true);
+
+        FlowDefinitions.ToolDefinition tool = tool("register_vehicle_purchase", 2, "Registrar compra", List.of());
+
+        try {
+            method.invoke(service, tool, Map.of());
+            fail("Debe lanzar excepción tras agotar reintentos");
+        } catch (InvocationTargetException e) {
+            assertInstanceOf(McpToolException.class, e.getCause());
+        }
+
+        assertEquals(3, mcpCallCount.get(), "Debe reintentar hasta maxMcpRetries + 1");
+    }
+
+    @Test
+    @DisplayName("un ALREADY_EXISTS marca el paso cumplido y desbloquea los dependientes")
+    void alreadyExistsMarksStepCompletedAndUnlocksDependents() throws Exception {
+        mcpFailure = new McpToolException("Falló la herramienta MCP: ALREADY_EXISTS",
+                "ALREADY_EXISTS", false,
+                Map.of("error_code", "ALREADY_EXISTS", "purchase_order_id", "po-1"));
+
+        FlowService.AgentLoopState state = new FlowService.AgentLoopState();
+        setCurrentStepOrder(state, 2);
+        setCurrentStep(state, "registrar_compra");
+        FlowDefinitions.FlowDefinition flow = flowDefinitions.getFlows().get("compra-vehiculo");
+        FlowDefinitions.ToolDefinition register = flow.getTools().stream()
+                .filter(candidate -> "register_vehicle_purchase".equals(candidate.getName()))
+                .findFirst().orElseThrow();
+
+        Method execute = FlowService.class.getDeclaredMethod("executeToolStep",
+                String.class, String.class, List.class, FlowService.AgentLoopState.class,
+                FlowDefinitions.ToolDefinition.class, AiService.AiToolCall.class);
+        execute.setAccessible(true);
+
+        boolean success = (boolean) execute.invoke(service, "compra-vehiculo", "exec-1",
+                new ArrayList<Map<String, Object>>(), state, register,
+                new AiService.AiToolCall("call-1", "register_vehicle_purchase",
+                        Map.of("customer_id", "c-1", "vehicle_id", "v-1", "sales_agent_id", "a-1")));
+
+        assertTrue(success, "El resultado ya existente se trata como paso cumplido");
+        assertTrue(getCompletedTools(state).contains("register_vehicle_purchase"));
+        assertFalse(getFailedTools(state).contains("register_vehicle_purchase"));
+        assertEquals("po-1", getToolResults(state).get("register_vehicle_purchase").get("purchase_order_id"));
+
+        Method specs = FlowService.class.getDeclaredMethod("getToolSpecs",
+                FlowDefinitions.FlowDefinition.class, FlowService.AgentLoopState.class);
+        specs.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        List<AiService.ToolSpec> offered = (List<AiService.ToolSpec>) specs.invoke(service, flow, state);
+
+        assertTrue(offered.stream().anyMatch(spec -> "set_payment_method".equals(spec.name())),
+                "El siguiente paso debe ofrecerse al modelo tras cumplirse su dependencia");
+    }
+
+    @Test
+    @DisplayName("si el agente termina con pasos pendientes, el flujo se pausa")
+    void earlyStopWithPendingStepsPausesForHumanInput() throws Exception {
+        FlowService.AgentLoopState state = new FlowService.AgentLoopState();
+        setCompletedTools(state, List.of("get_vehicle_information"));
+        FlowDefinitions.FlowDefinition flow = flowDefinitions.getFlows().get("compra-vehiculo");
+
+        Method complete = FlowService.class.getDeclaredMethod("completeFlow",
+                FlowDefinitions.FlowDefinition.class, String.class, String.class,
+                FlowResponse.class, String.class, Set.class);
+        complete.setAccessible(true);
+
+        try {
+            complete.invoke(service, flow, "compra-vehiculo", "exec-1",
+                    new FlowResponse(), "listo", new java.util.HashSet<>(getCompletedTools(state)));
+            fail("Debe pausar el flujo en lugar de fallarlo");
+        } catch (InvocationTargetException e) {
+            assertInstanceOf(RequiresHumanInterventionException.class, e.getCause());
+            assertTrue(e.getCause().getMessage().contains("set_payment_method"),
+                    "El mensaje debe indicar qué pasos quedaron pendientes");
+        }
     }
 
     @Test
@@ -389,6 +506,14 @@ class FlowServiceResilienceTest {
     }
 
     @Test
+    @DisplayName("debe rechazar la reanudación asíncrona sin estado pausado")
+    void shouldRejectAsyncResumeWithoutPausedState() {
+        assertThrows(IllegalStateException.class,
+                () -> service.resumeFlowAsync("nonexistent-exec", null),
+                "Debe responder 404 antes de aceptar la reanudación");
+    }
+
+    @Test
     @DisplayName("debe marcar paso para reintento eliminándolo de completados")
     void shouldMarkStepForRetry() throws Exception {
         FlowDefinitions.FlowDefinition flow = new FlowDefinitions.FlowDefinition();
@@ -421,6 +546,103 @@ class FlowServiceResilienceTest {
         assertNotNull(retrieved);
         assertFalse(getCompletedTools(retrieved.agentState()).contains("register_vehicle_purchase"),
                 "La herramienta debe eliminarse de completados para reintentarla");
+    }
+
+    @Test
+    @DisplayName("debe permitir reintentar un paso que falló")
+    void shouldAllowRetryingFailedStep() throws Exception {
+        FlowDefinitions.FlowDefinition flow = new FlowDefinitions.FlowDefinition();
+        flow.setProcessTemplateName("compra-vehiculo");
+
+        FlowDefinitions.ToolDefinition tool = tool("register_vehicle_purchase", 2,
+                "Registrar compra", List.of());
+        flow.setTools(List.of(tool));
+
+        FlowService.AgentLoopState state = new FlowService.AgentLoopState();
+        setFailedTools(state, List.of("register_vehicle_purchase"));
+
+        FlowStateManager stateManager = new FlowStateManager();
+        stateManager.store("exec-retry-failed",
+                new FlowStateManager.PausedFlowState("compra-vehiculo", flow, List.of(), state));
+
+        Field smField = FlowService.class.getDeclaredField("flowStateManager");
+        smField.setAccessible(true);
+        smField.set(service, stateManager);
+
+        FlowResponse response = service.retryStep("exec-retry-failed", 2);
+
+        assertEquals("RETRYING", response.getStatus());
+        FlowStateManager.PausedFlowState retrieved = stateManager.retrieve("exec-retry-failed");
+        assertNotNull(retrieved);
+        assertFalse(getFailedTools(retrieved.agentState()).contains("register_vehicle_purchase"));
+        assertTrue(retrieved.messages().getLast().get("content").toString().contains("reintentar"));
+    }
+
+    @Test
+    @DisplayName("debe rechazar el reintento de un paso que nunca se ejecutó")
+    void shouldRejectRetryOfStepNeverExecuted() throws Exception {
+        FlowDefinitions.FlowDefinition flow = new FlowDefinitions.FlowDefinition();
+        flow.setProcessTemplateName("compra-vehiculo");
+        flow.setTools(List.of(tool("set_payment_method", 3, "Configurar pago", List.of())));
+
+        FlowStateManager stateManager = new FlowStateManager();
+        stateManager.store("exec-retry-unknown",
+                new FlowStateManager.PausedFlowState("compra-vehiculo", flow, List.of(),
+                        new FlowService.AgentLoopState()));
+
+        Field smField = FlowService.class.getDeclaredField("flowStateManager");
+        smField.setAccessible(true);
+        smField.set(service, stateManager);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> service.retryStep("exec-retry-unknown", 3));
+    }
+
+    @Test
+    @DisplayName("debe inyectar guía de reintento al reanudar tras un paso fallido")
+    void shouldInjectRetryGuidanceOnResume() throws Exception {
+        FlowDefinitions.FlowDefinition flow = flowDefinitions.getFlows().get("compra-vehiculo");
+
+        FlowService.AgentLoopState state = new FlowService.AgentLoopState();
+        setCompletedTools(state, List.of("get_vehicle_information"));
+        setFailedTools(state, List.of("register_vehicle_purchase", "set_payment_method"));
+
+        List<Map<String, Object>> messages = new ArrayList<>();
+        messages.add(Map.of("role", "system", "content", "prompt"));
+
+        Method method = FlowService.class.getDeclaredMethod("injectPendingRetryGuidance",
+                FlowDefinitions.FlowDefinition.class, List.class,
+                FlowService.AgentLoopState.class, String.class);
+        method.setAccessible(true);
+        method.invoke(service, flow, messages, state, "exec-guidance");
+
+        assertEquals(2, messages.size());
+        String guidance = messages.getLast().get("content").toString();
+        assertTrue(guidance.contains("register_vehicle_purchase"));
+        assertTrue(guidance.contains("set_payment_method"));
+        assertFalse(guidance.contains("get_vehicle_information"),
+                "Los pasos ya completados no deben pedirse de nuevo");
+    }
+
+    @Test
+    @DisplayName("no debe inyectar guía si no hay pasos fallidos pendientes")
+    void shouldNotInjectGuidanceWithoutPendingFailures() throws Exception {
+        FlowDefinitions.FlowDefinition flow = flowDefinitions.getFlows().get("compra-vehiculo");
+
+        FlowService.AgentLoopState state = new FlowService.AgentLoopState();
+        setCompletedTools(state, List.of("get_vehicle_information"));
+        setFailedTools(state, List.of("get_vehicle_information"));
+
+        List<Map<String, Object>> messages = new ArrayList<>();
+        messages.add(Map.of("role", "system", "content", "prompt"));
+
+        Method method = FlowService.class.getDeclaredMethod("injectPendingRetryGuidance",
+                FlowDefinitions.FlowDefinition.class, List.class,
+                FlowService.AgentLoopState.class, String.class);
+        method.setAccessible(true);
+        method.invoke(service, flow, messages, state, "exec-guidance-none");
+
+        assertEquals(1, messages.size());
     }
 
     @Test
@@ -597,15 +819,35 @@ class FlowServiceResilienceTest {
         return val != null ? new ArrayList<>((java.util.Set<String>) val) : List.of();
     }
 
+    private void setFailedTools(FlowService.AgentLoopState state, List<String> tools) throws Exception {
+        Field f = FlowService.AgentLoopState.class.getDeclaredField("failedTools");
+        f.setAccessible(true);
+        f.set(state, new java.util.HashSet<>(tools));
+    }
+
+    private List<String> getFailedTools(FlowService.AgentLoopState state) throws Exception {
+        Field f = FlowService.AgentLoopState.class.getDeclaredField("failedTools");
+        f.setAccessible(true);
+        Object val = f.get(state);
+        return val != null ? new ArrayList<>((java.util.Set<String>) val) : List.of();
+    }
+
     private void setCurrentStep(FlowService.AgentLoopState state, String step) throws Exception {
         Field f = FlowService.AgentLoopState.class.getDeclaredField("currentStep");
         f.setAccessible(true);
         f.set(state, step);
     }
 
-    private void setCurrentStepOrder(FlowService.AgentLoopState state, int order) throws Exception {
+    private void setCurrentStepOrder(FlowService.AgentLoopState state, int stepOrder) throws Exception {
         Field f = FlowService.AgentLoopState.class.getDeclaredField("currentStepOrder");
         f.setAccessible(true);
-        f.set(state, order);
+        f.setInt(state, stepOrder);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Map<String, Object>> getToolResults(FlowService.AgentLoopState state) throws Exception {
+        Field f = FlowService.AgentLoopState.class.getDeclaredField("toolResults");
+        f.setAccessible(true);
+        return (Map<String, Map<String, Object>>) f.get(state);
     }
 }

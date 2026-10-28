@@ -35,12 +35,16 @@ public class FlowController {
         return ResponseEntity.accepted().body(flowService.startFlowAsync(request));
     }
 
+    /**
+     * Reanuda el flujo en segundo plano. Responde 202 en cuanto valida que hay
+     * estado pausado; el cliente sigue el resultado por SSE.
+     */
     @PostMapping("/flows/{executionId}/resume")
-    public ResponseEntity<FlowResponse> resumeFlow(@PathVariable String executionId,
+    public ResponseEntity<FlowAsyncAccepted> resumeFlow(@PathVariable String executionId,
             @RequestParam(required = false) String userInput) {
         try {
-            FlowResponse response = flowService.resumeFlow(executionId, userInput);
-            return ResponseEntity.ok(response);
+            FlowAsyncAccepted response = flowService.resumeFlowAsync(executionId, userInput);
+            return ResponseEntity.accepted().body(response);
         } catch (IllegalStateException ex) {
             log.warn("[RESUME] No se encontró estado pausado para la ejecución; se devuelve 404: executionId={}", executionId);
             return ResponseEntity.notFound().build();

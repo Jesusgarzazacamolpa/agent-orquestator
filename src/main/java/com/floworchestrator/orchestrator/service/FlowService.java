@@ -67,6 +67,7 @@ public class FlowService {
     private static final String FLOW_CODE_PAUSED = "PAUSED_FOR_HUMAN";
     private static final String FLOW_CODE_FLOW_ERROR = "ERR_FLOW_01";
     private static final String FLOW_CODE_START_ERROR = "ERR_FLOW_START";
+    private static final String ERROR_CODE_ALREADY_EXISTS = "ALREADY_EXISTS";
 
     private final WebClient webClient;
     private final AiService aiService;
@@ -186,15 +187,44 @@ public class FlowService {
     }
 
     public FlowResponse resumeFlow(String executionId, String userInput) {
-        return withTraceId(traceId -> doResumeFlow(executionId, userInput, traceId));
+        return withTraceId(traceId ->
+                doResumeFlow(executionId, userInput, retrievePausedState(executionId), traceId));
     }
 
-    private FlowResponse doResumeFlow(String executionId, String userInput, String traceId) {
+    /**
+     * Consume el estado pausado y reanuda en segundo plano. El cliente recibe
+     * 202 de inmediato; el resultado se sigue por SSE. Evita que el llamador
+     * agote su timeout HTTP mientras el LLM trabaja y que dos reanudaciones
+     * simultáneas ejecuten el flujo dos veces.
+     */
+    public FlowAsyncAccepted resumeFlowAsync(String executionId, String userInput) {
+        FlowStateManager.PausedFlowState pausedState = retrievePausedState(executionId);
+
+        String traceId = newTraceId();
+        flowExecutor.submit(() -> {
+            try {
+                withTraceId(traceId, id -> doResumeFlow(executionId, userInput, pausedState, id));
+            } catch (RuntimeException ex) {
+                log.error("[ASYNC] No se pudo reanudar el flujo: executionId={}, traceId={}, error={}",
+                        executionId, traceId, messageOf(ex), ex);
+            }
+        });
+        log.info("[ASYNC] Reanudación aceptada: executionId={}, flowId={}, traceId={}",
+                executionId, pausedState.flowId(), traceId);
+        return FlowAsyncAccepted.accepted(UUID.randomUUID().toString(), pausedState.flowId(),
+                executionId, traceId);
+    }
+
+    private FlowStateManager.PausedFlowState retrievePausedState(String executionId) {
         FlowStateManager.PausedFlowState pausedState = flowStateManager.retrieve(executionId);
         if (pausedState == null) {
             throw new IllegalStateException("No se encontró un flujo pausado para executionId: " + executionId);
         }
+        return pausedState;
+    }
 
+    private FlowResponse doResumeFlow(String executionId, String userInput,
+                                      FlowStateManager.PausedFlowState pausedState, String traceId) {
         String flowId = pausedState.flowId();
         FlowDefinition flow = pausedState.flowDefinition();
         List<Map<String, Object>> messages = new ArrayList<>(pausedState.messages());
@@ -208,6 +238,8 @@ public class FlowService {
             log.info("[RESUME] Entrada del usuario inyectada: executionId={}, inputLength={}",
                     executionId, userInput.length());
         }
+
+        injectPendingRetryGuidance(flow, messages, state, executionId);
 
         log.info("[RESUME] Reanudando flujo: executionId={}, flowId={}, traceId={}",
                 executionId, flowId, traceId);
@@ -250,21 +282,27 @@ public class FlowService {
                                 + " en el flujo " + flow.getProcessTemplateName()));
 
         AgentLoopState state = pausedState.agentState();
-        if (!state.completedTools.contains(tool.getName())) {
+        boolean executedBefore = state.completedTools.contains(tool.getName())
+                || state.failedTools.contains(tool.getName());
+        if (!executedBefore) {
             throw new IllegalArgumentException(
-                    "El paso " + tool.getName() + " no está marcado como completado/fallido");
+                    "El paso " + tool.getName() + " no registra una ejecución previa que pueda reintentarse");
         }
 
         state.completedTools.remove(tool.getName());
+        state.failedTools.remove(tool.getName());
         state.currentStepOrder = stepOrder;
         state.currentStep = tool.getStepName();
+
+        List<Map<String, Object>> messages = new ArrayList<>(pausedState.messages());
+        messages.add(retryStepInstruction(tool));
 
         log.info("[RETRY-STEP] Paso marcado para reintento: executionId={}, stepOrder={}, tool={}, traceId={}",
                 executionId, stepOrder, tool.getName(), traceId);
 
         flowStateManager.store(executionId,
                 new FlowStateManager.PausedFlowState(pausedState.flowId(), flow,
-                        List.copyOf(pausedState.messages()), state));
+                        List.copyOf(messages), state));
 
         flowEventPublisher.publish(FlowExecutionEvent.withError(
                 executionId, pausedState.flowId(), "STEP_RETRY", stepOrder, state.currentStep,
@@ -277,6 +315,35 @@ public class FlowService {
         response.setCurrentStep(state.currentStep);
         response.setSteps(flow.getTools().stream().map(ToolDefinition::getStepName).toList());
         return response;
+    }
+
+    private Map<String, Object> retryStepInstruction(ToolDefinition tool) {
+        return Map.of(
+                "role", ROLE_USER,
+                "content", "El operador solicitó reintentar el paso '" + tool.getStepName()
+                        + "' (herramienta " + tool.getName() + "). Vuelve a invocarla ahora con los "
+                        + "argumentos ya recopilados, corrigiendo la causa del error anterior si la hubo, "
+                        + "y continúa con el resto del flujo hasta completarlo.");
+    }
+
+    private void injectPendingRetryGuidance(FlowDefinition flow, List<Map<String, Object>> messages,
+                                            AgentLoopState state, String executionId) {
+        Set<String> pendingFailures = new java.util.TreeSet<>(getRequiredTools(flow));
+        pendingFailures.removeAll(state.completedTools);
+        pendingFailures.retainAll(state.failedTools);
+        if (pendingFailures.isEmpty()) {
+            return;
+        }
+        messages.add(Map.of(
+                "role", ROLE_USER,
+                "content", "El operador solicitó reanudar el flujo. Los pasos pendientes " + pendingFailures
+                        + " fallaron en el intento anterior, pero el fallo no cierra el proceso: "
+                        + "revisa el error devuelto por cada herramienta y vuelve a invocarla. "
+                        + "Si el error indica datos ya registrados, reutiliza el recurso existente; "
+                        + "si indica argumentos inválidos, corrígelos. No finalices el flujo sin "
+                        + "completar los pasos obligatorios."));
+        log.info("[RESUME] Guía de reintento inyectada: executionId={}, tools={}",
+                executionId, pendingFailures);
     }
 
     private FlowResponse handleAgentLoopException(
@@ -533,8 +600,12 @@ public class FlowService {
                               FlowResponse response, String content, Set<String> completedTools) {
         Set<String> requiredTools = getRequiredTools(flow);
         if (!completedTools.containsAll(requiredTools)) {
-            throw new IllegalStateException("El agente terminó antes de completar todas las herramientas obligatorias: "
-                    + difference(requiredTools, completedTools));
+            // El agente dejó de llamar herramientas con pasos pendientes: se pausa
+            // para que el usuario aporte lo que falta en lugar de fallar el flujo.
+            throw new RequiresHumanInterventionException(
+                    "El agente terminó el turno sin completar los pasos obligatorios: "
+                            + difference(requiredTools, completedTools)
+                            + ". Proporciona la información pendiente y reanuda el flujo.");
         }
         log.info("[DONE] Flujo completado: flowId={}, executionId={}", flowId, executionId);
         flowEventPublisher.publish(FlowExecutionEvent.withError(
@@ -572,6 +643,7 @@ public class FlowService {
             } catch (IllegalArgumentException ex) {
                 log.warn("[RETRY] Llamada a herramienta del agente rechazada: flowId={}, executionId={}, tool={}, reason={}",
                         flowId, executionId, toolName, ex.getMessage());
+                state.failedTools.add(toolName);
                 addToolErrorMessage(messages, toolName, toolCall.id(), ex.getMessage());
                 UserFacingErrorMapper.ErrorMapping userError =
                         errorMapper.mapError(toolName, tool.getServer(), ex.getMessage());
@@ -618,6 +690,7 @@ public class FlowService {
             }
             state.toolResults.put(toolName, result);
             state.completedTools.add(toolName);
+            state.failedTools.remove(toolName);
             flowEventPublisher.publish(FlowExecutionEvent.withError(
                     executionId, flowId, "STEP_COMPLETED", state.currentStepOrder, state.currentStep,
                     toolName, tool.getServer(), "COMPLETED", null));
@@ -636,10 +709,16 @@ public class FlowService {
                     userError.statusType(), userError.errorCode()));
             throw ex;
         } catch (RuntimeException ex) {
+            if (ex instanceof McpToolException toolException
+                    && ERROR_CODE_ALREADY_EXISTS.equals(toolException.getErrorCode())) {
+                return reuseExistingToolResult(executionId, flowId, tool, state, toolException);
+            }
             String toolError = messageOf(ex);
+            state.failedTools.add(toolName);
             log.warn("[FAIL] Falló la herramienta MCP; se agrega el error al contexto para que el agente reintente: "
-                            + "flowId={}, executionId={}, tool={}, error={}",
-                    flowId, executionId, toolName, toolError);
+                            + "flowId={}, executionId={}, tool={}, retryable={}, error={}",
+                    flowId, executionId, toolName,
+                    ex instanceof McpToolException toolException && toolException.isRetryable(), toolError);
             addToolErrorMessage(messages, toolName, toolCall.id(), toolError);
             UserFacingErrorMapper.ErrorMapping userError =
                     errorMapper.mapError(toolName, tool.getServer(), toolError);
@@ -652,8 +731,34 @@ public class FlowService {
         }
     }
 
+    /**
+     * Un error {@code ALREADY_EXISTS} significa que la operación ya se aplicó con
+     * anterioridad: el paso queda cumplido y sus dependencias se desbloquean. Si no
+     * se tratara así, el agente quedaría atrapado reintentando el mismo paso porque
+     * las herramientas siguientes nunca se ofrecerían.
+     */
+    private boolean reuseExistingToolResult(String executionId, String flowId,
+                                            FlowDefinitions.ToolDefinition tool,
+                                            AgentLoopState state, McpToolException ex) {
+        String toolName = tool.getName();
+        Map<String, Object> result = new HashMap<>(ex.getPayload());
+        result.putIfAbsent("status", ERROR_CODE_ALREADY_EXISTS);
+        result.putIfAbsent("reused_existing_resource", true);
+        state.toolResults.put(toolName, result);
+        state.completedTools.add(toolName);
+        state.failedTools.remove(toolName);
+        flowEventPublisher.publish(FlowExecutionEvent.withError(
+                executionId, flowId, "STEP_COMPLETED", state.currentStepOrder, state.currentStep,
+                toolName, tool.getServer(), "COMPLETED", null));
+        log.info("[OK] La herramienta ya estaba aplicada; se reutiliza el recurso existente: "
+                        + "flowId={}, executionId={}, tool={}",
+                flowId, executionId, toolName);
+        return true;
+    }
+
     static class AgentLoopState {
         private final Set<String> completedTools = new HashSet<>();
+        private final Set<String> failedTools = new HashSet<>();
         private final Map<String, Map<String, Object>> toolResults = new HashMap<>();
         private final Map<String, List<DiscoveredTool>> discoveredByServer = new HashMap<>();
         private int currentStepOrder = 0;
@@ -664,6 +769,7 @@ public class FlowService {
             // las herramientas para no reutilizar esquemas obsoletos.
             return new AgentStateSnapshot(
                     new HashSet<>(completedTools),
+                    new HashSet<>(failedTools),
                     new HashMap<>(toolResults),
                     currentStepOrder,
                     currentStep);
@@ -673,6 +779,9 @@ public class FlowService {
             AgentLoopState state = new AgentLoopState();
             if (snapshot.completedTools() != null) {
                 state.completedTools.addAll(snapshot.completedTools());
+            }
+            if (snapshot.failedTools() != null) {
+                state.failedTools.addAll(snapshot.failedTools());
             }
             if (snapshot.toolResults() != null) {
                 state.toolResults.putAll(snapshot.toolResults());
@@ -735,6 +844,23 @@ public class FlowService {
     }
 
     private Map<String, Object> executeToolWithRetry(ToolDefinition tool, Map<String, Object> arguments) {
+        int maxAttempts = config.maxMcpRetries() + 1;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return executeToolAttempt(tool, arguments);
+            } catch (McpToolException ex) {
+                if (!ex.isRetryable() || attempt >= maxAttempts) {
+                    throw ex;
+                }
+                log.warn("[RETRY] La herramienta MCP reportó un fallo transitorio; se reintenta: "
+                                + "tool={}, errorCode={}, attempt={}/{}",
+                        tool.getName(), ex.getErrorCode(), attempt, maxAttempts);
+                backoffBeforeToolRetry(attempt);
+            }
+        }
+    }
+
+    private Map<String, Object> executeToolAttempt(ToolDefinition tool, Map<String, Object> arguments) {
         CircuitBreaker circuitBreaker = circuitBreakerFor(tool.getServer());
         Retry retry = retryFor(tool.getServer());
 
@@ -753,6 +879,15 @@ public class FlowService {
         return result.get();
     }
 
+    private void backoffBeforeToolRetry(int attempt) {
+        try {
+            Thread.sleep(Duration.ofSeconds(1).multipliedBy(attempt).toMillis());
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrumpido durante la espera entre reintentos de la herramienta", ex);
+        }
+    }
+
     private CircuitBreaker circuitBreakerFor(String server) {
         return circuitBreakers.computeIfAbsent(server, name ->
                 circuitBreakerRegistry.circuitBreaker("mcp-" + name, CircuitBreakerConfig.custom()
@@ -760,6 +895,7 @@ public class FlowService {
                         .slidingWindowSize(10)
                         .minimumNumberOfCalls(5)
                         .waitDurationInOpenState(config.mcpCircuitBreakerResetTimeout())
+                        .ignoreExceptions(McpToolException.class)
                         .build())
         );
     }
@@ -771,6 +907,7 @@ public class FlowService {
                         .intervalFunction(IntervalFunction.ofExponentialBackoff(
                                 Duration.ofSeconds(1), 2.0))
                         .retryExceptions(RuntimeException.class, TimeoutException.class)
+                        .ignoreExceptions(McpToolException.class)
                         .build())
         );
     }

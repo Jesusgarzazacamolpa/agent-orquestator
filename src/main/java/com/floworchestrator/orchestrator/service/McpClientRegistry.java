@@ -45,16 +45,28 @@ public class McpClientRegistry implements McpToolClient {
                     McpSchema.CallToolRequest.builder(toolName)
                             .arguments(arguments)
                             .build());
+            String content = textContent(result);
             if (Boolean.TRUE.equals(result.isError())) {
-                throw new IllegalStateException("Falló la herramienta MCP: " + textContent(result));
+                throw toToolException(toolName, content);
             }
-            return parseResult(textContent(result));
+            return parseResult(content);
         });
+    }
+
+    private McpToolException toToolException(String toolName, String content) {
+        Map<String, Object> payload = parseResult(content);
+        String errorCode = payload.get("error_code") instanceof String code ? code : "TOOL_ERROR";
+        boolean retryable = Boolean.TRUE.equals(payload.get("retryable"));
+        return new McpToolException("Falló la herramienta MCP " + toolName + ": " + content,
+                errorCode, retryable, payload);
     }
 
     private <T> T withRetry(String serverName, Function<McpSyncClient, T> operation) {
         try {
             return operation.apply(client(serverName));
+        } catch (McpToolException ex) {
+            // Un error de negocio no invalida la sesión ni debe repetirse a ciegas.
+            throw ex;
         } catch (RuntimeException ex) {
             log.warn("[MCP] Sesión invalidada para '{}'; se recrea el cliente y se reintenta: {}", serverName, ex.getMessage());
             invalidateClient(serverName);

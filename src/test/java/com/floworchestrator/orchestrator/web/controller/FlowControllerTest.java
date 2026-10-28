@@ -17,6 +17,36 @@ import static org.mockito.Mockito.when;
 class FlowControllerTest {
 
     @Test
+    @DisplayName("debe responder 202 al reanudar sin bloquear la petición")
+    void shouldReturnAcceptedWhenResuming() {
+        FlowService flowService = mock(FlowService.class);
+        when(flowService.resumeFlowAsync("exec-1", "dato"))
+                .thenReturn(FlowAsyncAccepted.accepted(
+                        "request-1", "compra-vehiculo", "exec-1", "trace-1"));
+
+        FlowController controller = new FlowController(flowService);
+
+        ResponseEntity<FlowAsyncAccepted> response = controller.resumeFlow("exec-1", "dato");
+
+        assertEquals(HttpStatus.ACCEPTED, response.getStatusCode());
+        assertEquals("exec-1", response.getBody().executionId());
+    }
+
+    @Test
+    @DisplayName("debe responder 404 al reanudar sin estado pausado")
+    void shouldReturnNotFoundWhenResumingUnknownExecution() {
+        FlowService flowService = mock(FlowService.class);
+        when(flowService.resumeFlowAsync("exec-missing", null))
+                .thenThrow(new IllegalStateException("sin estado"));
+
+        FlowController controller = new FlowController(flowService);
+
+        ResponseEntity<FlowAsyncAccepted> response = controller.resumeFlow("exec-missing", null);
+
+        assertEquals(HttpStatus.NOT_FOUND, response.getStatusCode());
+    }
+
+    @Test
     @DisplayName("debe responder 202 al iniciar un flujo asíncrono")
     void shouldReturnAcceptedWhenStartingFlowAsynchronously() {
         FlowService flowService = mock(FlowService.class);

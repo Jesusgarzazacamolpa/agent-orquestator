@@ -8,6 +8,11 @@ import lombok.Data;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * Petición de arranque de un flujo. Además de {@code flowId} y {@code executionId},
+ * acepta atributos arbitrarios (por ejemplo {@code customerId}) que se inyectan en
+ * los prompts como variables de plantilla.
+ */
 @Data
 public class FlowRequest {
     @NotBlank(message = "El flowId es obligatorio.")
@@ -17,6 +22,7 @@ public class FlowRequest {
     @JsonIgnore
     private Map<String, Object> attributes = new HashMap<>();
 
+    /** Recoge cualquier propiedad desconocida del JSON y la trata como atributo del prompt. */
     @JsonAnySetter
     public void setAttribute(String name, Object value) {
         if ("attributes".equals(name) && value instanceof Map) {

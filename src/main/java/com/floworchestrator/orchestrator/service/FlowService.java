@@ -40,6 +40,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -56,6 +57,11 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+/**
+ * Núcleo del orquestador: ejecuta el loop de agente sobre el LLM, valida y lanza
+ * las herramientas MCP en orden, pausa/reanuda flujos que requieren intervención
+ * humana y publica cada transición por SSE.
+ */
 @Service
 public class FlowService {
     private static final Logger log = LoggerFactory.getLogger(FlowService.class);
@@ -64,9 +70,8 @@ public class FlowService {
     private static final String ROLE_USER = "user";
     private static final String ROLE_ASSISTANT = "assistant";
     private static final String ROLE_TOOL = "tool";
-    private static final String FLOW_CODE_PAUSED = "PAUSED_FOR_HUMAN";
-    private static final String FLOW_CODE_FLOW_ERROR = "ERR_FLOW_01";
     private static final String FLOW_CODE_START_ERROR = "ERR_FLOW_START";
+    private static final String FLOW_CODE_CANCELLED = "FLOW_CANCELLED";
     private static final String ERROR_CODE_ALREADY_EXISTS = "ALREADY_EXISTS";
 
     private final WebClient webClient;
@@ -77,6 +82,7 @@ public class FlowService {
     private final McpToolClient mcpClientRegistry;
     private final FlowEventPublisher flowEventPublisher;
     private final FlowStateManager flowStateManager;
+    private final FlowInterruptionHandler interruptionHandler;
     private final UserFacingErrorMapper errorMapper;
     private final PiiMasker piiMasker;
     private final CircuitBreakerRegistry circuitBreakerRegistry;
@@ -96,6 +102,7 @@ public class FlowService {
             McpToolClient mcpClientRegistry,
             FlowEventPublisher flowEventPublisher,
             FlowStateManager flowStateManager,
+            FlowInterruptionHandler interruptionHandler,
             UserFacingErrorMapper errorMapper,
             PiiMasker piiMasker,
             CircuitBreakerRegistry circuitBreakerRegistry,
@@ -109,6 +116,7 @@ public class FlowService {
         this.mcpClientRegistry = mcpClientRegistry;
         this.flowEventPublisher = flowEventPublisher;
         this.flowStateManager = flowStateManager;
+        this.interruptionHandler = interruptionHandler;
         this.errorMapper = errorMapper;
         this.piiMasker = piiMasker;
         this.circuitBreakerRegistry = circuitBreakerRegistry;
@@ -117,6 +125,7 @@ public class FlowService {
         this.flowExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
 
+    /** Ejecuta el flujo de forma síncrona y devuelve el resultado final; se usa en el endpoint no asíncrono. */
     public FlowResponse createFlow(FlowRequest request) {
         return withTraceId(traceId -> doCreateFlow(request, traceId));
     }
@@ -154,6 +163,7 @@ public class FlowService {
                 request.getExecutionId(), traceId);
     }
 
+    /** Valida el flowId, resuelve el executionId y arranca el loop publicando el evento de inicio. */
     private FlowResponse doCreateFlow(FlowRequest request, String traceId) {
         Map.Entry<String, FlowDefinition> selectedFlow = selectFlow(request.getFlowId());
         String flowId = selectedFlow.getKey();
@@ -180,12 +190,13 @@ public class FlowService {
                 throw new IllegalStateException("El agente superó el número máximo de turnos");
             }
         } catch (RuntimeException ex) {
-            response = handleAgentLoopException(executionId, flowId, flow, messages, state, ex,
+            response = interruptionHandler.handle(executionId, flowId, flow, messages, state, ex,
                     false, request.getAttributes(), traceId);
         }
         return response;
     }
 
+    /** Reanuda un flujo pausado de forma síncrona; se usa cuando el llamador puede esperar al LLM. */
     public FlowResponse resumeFlow(String executionId, String userInput) {
         return withTraceId(traceId ->
                 doResumeFlow(executionId, userInput, retrievePausedState(executionId), traceId));
@@ -215,6 +226,7 @@ public class FlowService {
                 executionId, traceId);
     }
 
+    /** Recupera y consume el estado persistido; falla con {@link IllegalStateException} si no hay flujo pausado. */
     private FlowStateManager.PausedFlowState retrievePausedState(String executionId) {
         FlowStateManager.PausedFlowState pausedState = flowStateManager.retrieve(executionId);
         if (pausedState == null) {
@@ -223,6 +235,11 @@ public class FlowService {
         return pausedState;
     }
 
+    /**
+     * Rehidrata el estado pausado, inyecta la entrada del operador y, si la
+     * respuesta es una aprobación, reintenta la herramienta pendiente antes de
+     * volver al loop del agente.
+     */
     private FlowResponse doResumeFlow(String executionId, String userInput,
                                       FlowStateManager.PausedFlowState pausedState, String traceId) {
         String flowId = pausedState.flowId();
@@ -237,6 +254,10 @@ public class FlowService {
             messages.add(userMessage);
             log.info("[RESUME] Entrada del usuario inyectada: executionId={}, inputLength={}",
                     executionId, userInput.length());
+        }
+
+        if (isApprovalInput(userInput)) {
+            approvePendingIntervention(flow, flowId, executionId, messages, state);
         }
 
         injectPendingRetryGuidance(flow, messages, state, executionId);
@@ -257,18 +278,71 @@ public class FlowService {
                 throw new IllegalStateException("El agente superó el número máximo de turnos");
             }
         } catch (RuntimeException ex) {
-            response = handleAgentLoopException(executionId, flowId, flow, messages, state, ex,
+            response = interruptionHandler.handle(executionId, flowId, flow, messages, state, ex,
                     true, Map.of(), traceId);
         }
         return response;
     }
 
+    /**
+     * Cancela un flujo detenido (pausado o fallido) descartando su estado para
+     * que no pueda reanudarse. Los flujos en ejecución no se interrumpen a mitad
+     * de una herramienta: este endpoint aplica sobre el estado persistido.
+     */
+    public FlowResponse cancelFlow(String executionId) {
+        return withTraceId(traceId -> doCancelFlow(executionId, traceId));
+    }
+
+    /** Descarta el estado persistido y emite {@code FLOW_CANCELLED}; falla si la ejecución no tiene estado cancelable. */
+    private FlowResponse doCancelFlow(String executionId, String traceId) {
+        FlowStateManager.PausedFlowState pausedState = flowStateManager.retrieve(executionId);
+        if (pausedState == null) {
+            throw new IllegalStateException(
+                    "No se encontró un flujo cancelable para executionId: " + executionId);
+        }
+
+        String flowId = pausedState.flowId();
+        AgentLoopState state = pausedState.agentState();
+        String reason = "Cancelación solicitada por el operador.";
+        log.info("[CANCEL] Flujo cancelado; se descarta el estado: executionId={}, flowId={}, step={}, traceId={}",
+                executionId, flowId, state.currentStep, traceId);
+
+        flowEventPublisher.publish(FlowExecutionEvent.withUserAgentError(
+                executionId, flowId, "FLOW_CANCELLED", state.currentStepOrder, state.currentStep,
+                null, null, "CANCELLED", reason,
+                "Proceso cancelado", "El flujo se canceló y no continuará ejecutándose.",
+                "Iniciar un nuevo proceso", "warning", FLOW_CODE_CANCELLED));
+
+        FlowResponse response = new FlowResponse();
+        response.setId(executionId);
+        response.setTraceId(traceId);
+        response.setStatus("CANCELLED");
+        response.setFlowCode(FLOW_CODE_CANCELLED);
+        response.setCurrentStep(state.currentStep);
+        response.setMessage("El flujo fue cancelado y su estado se descartó.");
+        response.setErrorMessage(reason);
+        response.setUserErrorTitle("Proceso cancelado");
+        response.setUserErrorMessage("El flujo se canceló y no continuará ejecutándose.");
+        response.setUserErrorActionLabel("Iniciar un nuevo proceso");
+        response.setUserErrorStatusType("warning");
+        response.setSteps(pausedState.flowDefinition().getTools().stream()
+                .map(ToolDefinition::getStepName).toList());
+        return response;
+    }
+
+    /** Marca un paso fallido o completado como pendiente de reintento y guarda el estado; la ejecución ocurre en la siguiente reanudación. */
     public FlowResponse retryStep(String executionId, int stepOrder) {
         return withTraceId(traceId -> doRetryStep(executionId, stepOrder, traceId));
     }
 
+    /**
+     * Retrocede el estado del paso indicado para que el agente lo vuelva a invocar;
+     * solo acepta pasos con ejecución previa registrada. El estado se consulta con
+     * {@code peek} y solo se sobrescribe tras validar, de modo que una solicitud
+     * inválida no destruye el flujo pausado.
+     */
     private FlowResponse doRetryStep(String executionId, int stepOrder, String traceId) {
-        FlowStateManager.PausedFlowState pausedState = flowStateManager.retrieve(executionId);
+        FlowStateManager.PausedFlowState pausedState = flowStateManager.peek(executionId);
         if (pausedState == null) {
             throw new IllegalStateException("No se encontró un flujo pausado para executionId: " + executionId);
         }
@@ -317,6 +391,7 @@ public class FlowService {
         return response;
     }
 
+    /** Mensaje de usuario que ordena al agente reejecutar la herramienta del paso reintentado. */
     private Map<String, Object> retryStepInstruction(ToolDefinition tool) {
         return Map.of(
                 "role", ROLE_USER,
@@ -326,6 +401,11 @@ public class FlowService {
                         + "y continúa con el resto del flujo hasta completarlo.");
     }
 
+    /**
+     * Añade una instrucción al historial cuando quedan pasos obligatorios que
+     * fallaron en el intento anterior, para que el agente los reintente en lugar
+     * de cerrar el flujo con éxito.
+     */
     private void injectPendingRetryGuidance(FlowDefinition flow, List<Map<String, Object>> messages,
                                             AgentLoopState state, String executionId) {
         Set<String> pendingFailures = new java.util.TreeSet<>(getRequiredTools(flow));
@@ -346,91 +426,14 @@ public class FlowService {
                 executionId, pendingFailures);
     }
 
-    private FlowResponse handleAgentLoopException(
-            String executionId, String flowId, FlowDefinition flow,
-            List<Map<String, Object>> messages, AgentLoopState state,
-            RuntimeException ex, boolean isResume,
-            Map<String, Object> attributes, String traceId) {
-        FlowResponse response = new FlowResponse();
-        response.setId(executionId);
-        response.setTraceId(traceId);
-        response.setSteps(flow.getTools().stream().map(ToolDefinition::getStepName).toList());
-        response.setAttributes(attributes == null ? new HashMap<>() : new HashMap<>(attributes));
-
-        if (ex instanceof RequiresHumanInterventionException intervention) {
-            String errorMessage = messageOf(intervention);
-            String userTitle = "Se requiere información adicional";
-            String userMessage = "El agente necesita información adicional para continuar. "
-                    + "Proporciona los datos solicitados y reanuda el proceso.";
-            String userActionLabel = "Reanudar proceso";
-            String userStatusType = "info";
-            String logPrefix = isResume ? "[PAUSE] Flujo pausado nuevamente" : "[PAUSE] Flujo pausado";
-            log.warn("{}: executionId={}, step={}, reason={}",
-                    logPrefix, executionId, state.currentStep, errorMessage);
-            flowEventPublisher.publish(FlowExecutionEvent.withUserAgentError(
-                    executionId, flowId, "FLOW_PAUSED", state.currentStepOrder, state.currentStep,
-                    null, null, FLOW_CODE_PAUSED, errorMessage,
-                    userTitle, userMessage, userActionLabel, userStatusType, FLOW_CODE_PAUSED));
-            flowStateManager.store(executionId,
-                    new FlowStateManager.PausedFlowState(flowId, flow, List.copyOf(messages), state));
-            response.setStatus(FLOW_CODE_PAUSED);
-            response.setFlowCode(FLOW_CODE_PAUSED);
-            response.setCurrentStep(state.currentStep);
-            response.setErrorMessage(errorMessage);
-            response.setUserErrorTitle(userTitle);
-            response.setUserErrorMessage(userMessage);
-            response.setUserErrorActionLabel(userActionLabel);
-            response.setUserErrorStatusType(userStatusType);
-        } else if (ex instanceof LlmUnavailableException llmUnavailable) {
-            String userTitle = "Servicio de IA no disponible";
-            log.error("[AI-DEGRADED] Flujo detenido por indisponibilidad del LLM: executionId={}, "
-                            + "step={}, flowCode={}, error={}",
-                    executionId, state.currentStep, llmUnavailable.getFlowCode(), messageOf(ex));
-            flowEventPublisher.publish(FlowExecutionEvent.withUserAgentError(
-                    executionId, flowId, "FLOW_FAILED", state.currentStepOrder, state.currentStep,
-                    null, null, "FAILED", messageOf(ex),
-                    userTitle, llmUnavailable.getUserMessage(), llmUnavailable.getUserAction(),
-                    "warning", llmUnavailable.getFlowCode()));
-            flowStateManager.store(executionId,
-                    new FlowStateManager.PausedFlowState(flowId, flow, List.copyOf(messages), state));
-            response.setStatus("FAILED");
-            response.setFlowCode(llmUnavailable.getFlowCode());
-            response.setCurrentStep(state.currentStep);
-            response.setErrorMessage(messageOf(ex));
-            response.setUserErrorTitle(userTitle);
-            response.setUserErrorMessage(llmUnavailable.getUserMessage());
-            response.setUserErrorActionLabel(llmUnavailable.getUserAction());
-            response.setUserErrorStatusType("warning");
-        } else {
-            String errorMessage = messageOf(ex);
-            String logPrefix = isResume ? "[FAIL] Flujo falló al reanudar" : "[FAIL] El flujo falló";
-            log.error("{}: executionId={}, step={}, errorType={}, message={}",
-                    logPrefix, executionId, state.currentStep, ex.getClass().getSimpleName(), errorMessage);
-            UserFacingErrorMapper.ErrorMapping userError =
-                    errorMapper.mapError(state.currentStep, null, errorMessage);
-            flowEventPublisher.publish(FlowExecutionEvent.withUserAgentError(
-                    executionId, flowId, "FLOW_FAILED", state.currentStepOrder, state.currentStep,
-                    null, null, "FAILED", errorMessage,
-                    userError.title(), userError.message(), userError.actionLabel(),
-                    userError.statusType(), userError.errorCode()));
-            flowStateManager.store(executionId,
-                    new FlowStateManager.PausedFlowState(flowId, flow, List.copyOf(messages), state));
-            response.setStatus("FAILED");
-            response.setFlowCode(FLOW_CODE_FLOW_ERROR);
-            response.setCurrentStep(state.currentStep);
-            response.setErrorMessage(errorMessage);
-            response.setUserErrorTitle(userError.title());
-            response.setUserErrorMessage(userError.message());
-            response.setUserErrorActionLabel(userError.actionLabel());
-            response.setUserErrorStatusType(userError.statusType());
-        }
-        return response;
-    }
-
     private String messageOf(Exception ex) {
         return ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
     }
 
+    /**
+     * Resuelve el executionId: usa el del request o crea la ejecución en Control
+     * Center a partir de la plantilla de proceso del flujo.
+     */
     private String resolveExecutionId(FlowDefinition flow, FlowRequest request) {
         String executionId = request.getExecutionId();
         if (executionId != null && !executionId.isBlank()) {
@@ -467,6 +470,7 @@ public class FlowService {
         return controlCenterResponse.get("id").toString();
     }
 
+    /** Construye los mensajes iniciales system+user renderizando las plantillas con los atributos del request. */
     private List<Map<String, Object>> buildPromptMessages(FlowDefinition flow, FlowRequest request,
                                                           String flowId) {
         Map<String, Object> promptAttributes = new HashMap<>();
@@ -488,6 +492,11 @@ public class FlowService {
         return messages;
     }
 
+    /**
+     * Recorta el historial conservando siempre el mensaje system y los últimos
+     * mensajes; si el corte dejaría respuestas de herramienta sin su llamada,
+     * avanza el inicio para no enviar un historial inválido al LLM.
+     */
     private void trimContextIfNeeded(List<Map<String, Object>> messages) {
         if (messages.isEmpty() || messages.size() <= config.maxContextMessages()) {
             return;
@@ -511,10 +520,27 @@ public class FlowService {
                 messages.size(), config.maxContextMessages());
     }
 
+    /**
+     * Ejecuta turnos de agente hasta completar el flujo, pausar o agotar
+     * {@code maxAgentTurns}. Antes de cada turno cierra el flujo sin llamar al LLM
+     * si ya están todos los pasos obligatorios, y solo ofrece las herramientas
+     * cuyas dependencias están satisfechas. Devuelve {@code false} al agotar turnos.
+     */
     private boolean runAgentLoop(FlowDefinition flow, String flowId, String executionId,
                                  FlowResponse response, List<Map<String, Object>> messages,
                                  AgentLoopState state, String traceId) {
         for (int turn = 0; turn < config.maxAgentTurns(); turn++) {
+            Set<String> requiredTools = getRequiredTools(flow);
+            if (!requiredTools.isEmpty() && state.completedTools.containsAll(requiredTools)) {
+                // Pedir otro turno solo para redactar el cierre añade 30-60 s y expone
+                // el flujo a un timeout cuando los pasos de negocio ya terminaron.
+                log.info("[DONE] Pasos obligatorios completos; se cierra el flujo sin un turno "
+                                + "adicional del LLM: flowId={}, executionId={}",
+                        flowId, executionId);
+                completeFlow(flow, flowId, executionId, response,
+                        completionFallbackMessage(flow, state.completedTools), state.completedTools);
+                return true;
+            }
             log.info("[AGENT] Iniciando turno {}/{}: flowId={}, executionId={}",
                     turn + 1, config.maxAgentTurns(), flowId, executionId);
             trimContextIfNeeded(messages);
@@ -526,9 +552,9 @@ public class FlowService {
 
             AiResponse aiResponse = aiService.generateResponse(messages, toolSpecs, traceId, flowId);
             if (aiResponse.degraded()) {
-                // Si todos los pasos de negocio ya se ejecutaron, el fallo del turno
-                // final (resumen) no debe marcar el flujo como fallido.
-                if (state.completedTools.containsAll(getRequiredTools(flow))) {
+                // Defensivo: si no quedan pasos pendientes, el fallo del LLM no debe
+                // marcar el flujo como fallido.
+                if (state.completedTools.containsAll(requiredTools)) {
                     String fallbackMessage = completionFallbackMessage(flow, state.completedTools);
                     log.warn("[AI-DEGRADED] LLM no disponible después de completar todos los pasos "
                                     + "obligatorios; se cierra el flujo con un resumen de respaldo: "
@@ -569,6 +595,7 @@ public class FlowService {
         return false;
     }
 
+    /** Serializa la respuesta del modelo (incluidas sus tool calls) al formato del historial propio. */
     private Map<String, Object> assistantMessage(String content, List<AiToolCall> toolCalls) {
         Map<String, Object> assistantMessage = new HashMap<>();
         assistantMessage.put("role", ROLE_ASSISTANT);
@@ -591,11 +618,19 @@ public class FlowService {
         return call;
     }
 
+    /** Resumen con el que se cierra el flujo cuando no se pidió un turno final al LLM. */
     private String completionFallbackMessage(FlowDefinition flow, Set<String> completedTools) {
         return "El flujo " + flow.getProcessTemplateName() + " se completó correctamente ("
                 + completedTools.size() + " pasos ejecutados).";
     }
 
+    /**
+     * Cierra el flujo como COMPLETED si están todos los pasos obligatorios; si
+     * faltan, lanza {@link RequiresHumanInterventionException} para pausarlo en
+     * lugar de darlo por fallido.
+     *
+     * @throws RequiresHumanInterventionException si el agente dejó pasos obligatorios sin ejecutar.
+     */
     private void completeFlow(FlowDefinition flow, String flowId, String executionId,
                               FlowResponse response, String content, Set<String> completedTools) {
         Set<String> requiredTools = getRequiredTools(flow);
@@ -615,6 +650,12 @@ public class FlowService {
         response.setMessage(content);
     }
 
+    /**
+     * Procesa las tool calls del turno: descarta herramientas no permitidas, valida
+     * dependencias y argumentos, ejecuta cada paso y devuelve el resultado al modelo.
+     * Los errores se agregan al historial para que el agente pueda corregir en el
+     * siguiente turno en vez de abortar el flujo.
+     */
     private void processToolCalls(FlowDefinition flow, String flowId, String executionId,
                                   List<Map<String, Object>> messages, AgentLoopState state,
                                   List<AiToolCall> toolCalls) {
@@ -671,11 +712,76 @@ public class FlowService {
         }
     }
 
+    /** Restablece el paso en curso para que no quede marcado tras terminar una tool call. */
     private void resetCurrentStep(AgentLoopState state) {
         state.currentStepOrder = 0;
         state.currentStep = null;
     }
 
+    /** Considera aprobación la entrada que empieza por {@code APPROVED}, sin distinguir mayúsculas. */
+    private boolean isApprovalInput(String userInput) {
+        return userInput != null && userInput.strip().toUpperCase(Locale.ROOT).startsWith("APPROVED");
+    }
+
+    /** Guarda la herramienta, el toolCallId y los argumentos que quedaron pendientes de aprobación. */
+    private void rememberPendingIntervention(AgentLoopState state, ToolDefinition tool,
+                                             AiToolCall toolCall, Map<String, Object> result) {
+        state.pendingInterventionTool = tool.getName();
+        state.pendingInterventionToolCallId = toolCall.id();
+        state.pendingInterventionArguments = new HashMap<>(toolCall.arguments());
+        log.info("[PAUSE] Herramienta pendiente de autorización registrada: tool={}, step={}, status={}",
+                tool.getName(), tool.getStepName(), result.get("status"));
+    }
+
+    /**
+     * Al aprobar una intervención se reintenta la herramienta pendiente con
+     * {@code decision=APPROVED} sin depender de que el LLM decida invocarla: con
+     * modelos pequeños la respuesta suele venir sin tool calls y el flujo volvía
+     * a pausarse. El historial conserva la forma assistant(tool_call) → tool(result).
+     */
+    private void approvePendingIntervention(FlowDefinition flow, String flowId, String executionId,
+                                            List<Map<String, Object>> messages, AgentLoopState state) {
+        String toolName = state.pendingInterventionTool;
+        Map<String, Object> storedArguments = state.pendingInterventionArguments;
+        state.pendingInterventionTool = null;
+        state.pendingInterventionToolCallId = null;
+        state.pendingInterventionArguments = null;
+        if (toolName == null) {
+            return;
+        }
+
+        ToolDefinition tool = findTool(flow, toolName);
+        Map<String, Object> arguments = storedArguments == null
+                ? new HashMap<>()
+                : new HashMap<>(storedArguments);
+        DiscoveredTool discovered = discoverTool(tool.getServer(), toolName, state);
+        if (asMap(discovered.inputSchema().get("properties")).containsKey("decision")) {
+            arguments.put("decision", "APPROVED");
+        }
+
+        AiToolCall approvalCall = new AiToolCall(UUID.randomUUID().toString(), toolName, arguments);
+        log.info("[RESUME] Aprobación recibida; se reintenta la herramienta pendiente: "
+                + "executionId={}, tool={}", executionId, toolName);
+
+        state.currentStepOrder = tool.getStepOrder();
+        state.currentStep = tool.getStepName();
+        flowEventPublisher.publish(FlowExecutionEvent.withError(
+                executionId, flowId, "STEP_STARTED", state.currentStepOrder, state.currentStep,
+                toolName, tool.getServer(), "RUNNING", null));
+
+        messages.add(assistantMessage("", List.of(approvalCall)));
+        boolean success = executeToolStep(flowId, executionId, messages, state, tool, approvalCall);
+        if (success) {
+            addToolMessage(messages, toolName, approvalCall.id(), writeJson(state.toolResults.get(toolName)));
+        }
+        resetCurrentStep(state);
+    }
+
+    /**
+     * Ejecuta un paso MCP con reintentos y traduce el resultado a eventos y estado:
+     * éxito, intervención requerida ({@code requiresIntervention}), error
+     * {@code ALREADY_EXISTS} tratado como ya aplicado, o fallo devuelto al agente.
+     */
     private boolean executeToolStep(String flowId, String executionId,
                                     List<Map<String, Object>> messages, AgentLoopState state,
                                     ToolDefinition tool, AiToolCall toolCall) {
@@ -686,6 +792,10 @@ public class FlowService {
         try {
             Map<String, Object> result = executeToolWithRetry(tool, toolCall.arguments());
             if (isInterventionRequired(result)) {
+                rememberPendingIntervention(state, tool, toolCall, result);
+                // La conversación no puede quedar con un tool_call sin respuesta:
+                // el LLM recibiría un historial inválido al reanudar y respondería vacío.
+                addToolMessage(messages, toolName, toolCall.id(), writeJson(result));
                 throw new RequiresHumanInterventionException(extractInterventionReason(result));
             }
             state.toolResults.put(toolName, result);
@@ -756,6 +866,7 @@ public class FlowService {
         return true;
     }
 
+    /** Estado mutable de una ejecución (pasos completados/fallidos, resultados y tool pendiente) que se persiste al pausar. */
     static class AgentLoopState {
         private final Set<String> completedTools = new HashSet<>();
         private final Set<String> failedTools = new HashSet<>();
@@ -763,6 +874,17 @@ public class FlowService {
         private final Map<String, List<DiscoveredTool>> discoveredByServer = new HashMap<>();
         private int currentStepOrder = 0;
         private String currentStep = null;
+        private String pendingInterventionTool = null;
+        private String pendingInterventionToolCallId = null;
+        private Map<String, Object> pendingInterventionArguments = null;
+
+        String currentStepName() {
+            return currentStep;
+        }
+
+        int currentStepNumber() {
+            return currentStepOrder;
+        }
 
         AgentStateSnapshot snapshot() {
             // discoveredByServer se omite a propósito: al reanudar se redescubren
@@ -772,7 +894,12 @@ public class FlowService {
                     new HashSet<>(failedTools),
                     new HashMap<>(toolResults),
                     currentStepOrder,
-                    currentStep);
+                    currentStep,
+                    pendingInterventionTool,
+                    pendingInterventionToolCallId,
+                    pendingInterventionArguments == null
+                            ? null
+                            : new HashMap<>(pendingInterventionArguments));
         }
 
         static AgentLoopState fromSnapshot(AgentStateSnapshot snapshot) {
@@ -788,10 +915,20 @@ public class FlowService {
             }
             state.currentStepOrder = snapshot.currentStepOrder();
             state.currentStep = snapshot.currentStep();
+            state.pendingInterventionTool = snapshot.pendingInterventionTool();
+            state.pendingInterventionToolCallId = snapshot.pendingInterventionToolCallId();
+            state.pendingInterventionArguments = snapshot.pendingInterventionArguments() == null
+                    ? null
+                    : new HashMap<>(snapshot.pendingInterventionArguments());
             return state;
         }
     }
 
+    /**
+     * Construye las herramientas que se ofrecen al LLM: excluye las ya completadas
+     * y las que aún tienen dependencias pendientes, y toma descripción y esquema
+     * del descubrimiento MCP.
+     */
     private List<ToolSpec> getToolSpecs(FlowDefinition flow, AgentLoopState state) {
         return flow.getTools().stream()
                 .filter(tool -> !state.completedTools.contains(tool.getName()))
@@ -806,6 +943,7 @@ public class FlowService {
                 .toList();
     }
 
+    /** Descubre las tools del servidor MCP una sola vez por ejecución y devuelve la solicitada. */
     private DiscoveredTool discoverTool(String server, String toolName, AgentLoopState state) {
         List<DiscoveredTool> discoveredTools = state.discoveredByServer.computeIfAbsent(
                 server, serverName -> {
@@ -827,6 +965,10 @@ public class FlowService {
                 .collect(Collectors.toSet());
     }
 
+    /**
+     * Rechaza la llamada si alguna dependencia no está completada o si los
+     * argumentos no cumplen el JSON Schema descubierto de la herramienta.
+     */
     private void validateToolCall(ToolDefinition tool,
                                   Map<String, Object> modelArguments,
                                   AgentLoopState state) {
@@ -843,6 +985,10 @@ public class FlowService {
         return mcpClientRegistry.callTool(tool.getServer(), tool.getName(), arguments);
     }
 
+    /**
+     * Reintenta la herramienta solo cuando el error se declara retryable, hasta
+     * {@code maxMcpRetries + 1} intentos, con espera lineal creciente.
+     */
     private Map<String, Object> executeToolWithRetry(ToolDefinition tool, Map<String, Object> arguments) {
         int maxAttempts = config.maxMcpRetries() + 1;
         for (int attempt = 1; ; attempt++) {
@@ -860,6 +1006,10 @@ public class FlowService {
         }
     }
 
+    /**
+     * Ejecuta la llamada MCP con circuit breaker y retry propios del servidor;
+     * los errores de negocio ({@link McpToolException}) no se reintentan.
+     */
     private Map<String, Object> executeToolAttempt(ToolDefinition tool, Map<String, Object> arguments) {
         CircuitBreaker circuitBreaker = circuitBreakerFor(tool.getServer());
         Retry retry = retryFor(tool.getServer());
@@ -888,6 +1038,10 @@ public class FlowService {
         }
     }
 
+    /**
+     * Devuelve el circuit breaker del servidor MCP (se crea por servidor e ignora
+     * {@link McpToolException}, porque los errores de negocio no indican caída).
+     */
     private CircuitBreaker circuitBreakerFor(String server) {
         return circuitBreakers.computeIfAbsent(server, name ->
                 circuitBreakerRegistry.circuitBreaker("mcp-" + name, CircuitBreakerConfig.custom()
@@ -900,6 +1054,7 @@ public class FlowService {
         );
     }
 
+    /** Retry por servidor MCP con backoff exponencial; no reintenta errores de negocio. */
     private Retry retryFor(String server) {
         return retries.computeIfAbsent(server, name ->
                 retryRegistry.retry("mcp-" + name, RetryConfig.custom()
@@ -912,6 +1067,7 @@ public class FlowService {
         );
     }
 
+    /** Ejecuta la herramienta en un hilo virtual y corta la espera con {@code stepTimeout}. */
     private Map<String, Object> callToolWithTimeout(ToolDefinition tool, Map<String, Object> arguments)
             throws TimeoutException {
         CompletableFuture<Map<String, Object>> future =
@@ -933,11 +1089,13 @@ public class FlowService {
         }
     }
 
+    /** Contrato con las tools MCP: {@code requiresIntervention=true} significa que el flujo debe pausarse. */
     private boolean isInterventionRequired(Map<String, Object> result) {
         Object value = result.get("requiresIntervention");
         return value instanceof Boolean bool && bool;
     }
 
+    /** Extrae el motivo de la pausa del resultado de la tool ({@code reason} o {@code errorMessage}). */
     private String extractInterventionReason(Map<String, Object> result) {
         Object reason = result.get("reason");
         if (reason != null && !reason.toString().isBlank()) {
@@ -956,6 +1114,10 @@ public class FlowService {
                     + "information about|provide.*details).*",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
+    /**
+     * Heurística para detectar que el texto del LLM pide datos en lugar de haber
+     * terminado; solo aplica cuando el modelo no emitió tool calls.
+     */
     private boolean isRequestingUserInput(String content) {
         if (content == null || content.isBlank()) {
             return false;
@@ -1003,6 +1165,10 @@ public class FlowService {
         }
     }
 
+    /**
+     * Busca el flujo por flowId o por nombre de plantilla de proceso (sin distinguir
+     * mayúsculas) y valida su configuración antes de usarlo.
+     */
     private Map.Entry<String, FlowDefinition> selectFlow(String requestedFlowId) {
         if (requestedFlowId == null || requestedFlowId.isBlank()) {
             throw new IllegalArgumentException("El flowId es obligatorio");
@@ -1019,6 +1185,10 @@ public class FlowService {
         return selectedFlow;
     }
 
+    /**
+     * Verifica que el flujo tenga prompts y tools, y que cada tool tenga nombres
+     * únicos, servidor MCP declarado, orden positivo y nombre de paso.
+     */
     private void validateFlow(FlowDefinition flow) {
         if (flow.getProcessTemplateName() == null || flow.getProcessTemplateName().isBlank()
                 || flow.getSystemPromptTemplate() == null || flow.getSystemPromptTemplate().isBlank()
@@ -1051,6 +1221,11 @@ public class FlowService {
         return missing;
     }
 
+    /**
+     * Respaldo para modelos que escriben la tool call como JSON dentro del texto:
+     * extrae los fragmentos con {@code name} y {@code arguments} y descarta los que
+     * no corresponden a herramientas del flujo.
+     */
     private List<AiToolCall> parseToolCallsFromContent(String content, FlowDefinition flow,
                                                        String flowId, String executionId) {
         List<AiToolCall> result = new ArrayList<>();
@@ -1094,6 +1269,10 @@ public class FlowService {
         return result;
     }
 
+    /**
+     * Renderiza un prompt con StringTemplate desde un path {@code classpath:},
+     * un texto {@code inline:} o, si está vacío, un volcado de atributos.
+     */
     private String renderPrompt(String templatePath, Map<String, Object> attributes) {
         Map<String, Object> model = new HashMap<>();
         model.put("customerId", "");
@@ -1171,6 +1350,7 @@ public class FlowService {
         return UUID.randomUUID().toString().substring(0, 8);
     }
 
+    /** Libera los ejecutores de hilos virtuales de tools y de flujos asíncronos. */
     @PreDestroy
     public void shutdown() {
         toolExecutor.shutdownNow();

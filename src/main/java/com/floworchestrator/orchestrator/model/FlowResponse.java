@@ -8,6 +8,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+/**
+ * Resultado de una ejecución o reanudación de flujo: estado, paso actual y el
+ * contrato de error amigable que consumen Control Center y la UI.
+ */
 @Data
 @NoArgsConstructor
 public class FlowResponse {

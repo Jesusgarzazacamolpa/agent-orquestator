@@ -80,14 +80,13 @@ class FlowServiceTest {
     }
 
     @Test
-    @DisplayName("debe completar el flujo ejecutando las tools MCP y publicar eventos")
+    @DisplayName("debe completar el flujo ejecutando las tools MCP sin un turno final del LLM")
     void shouldCompleteFlowAndPublishEvents() throws InterruptedException {
         when(chatModel.call(any(Prompt.class))).thenReturn(
                 toolCallResponse("call-1", "get_vehicle_information"),
                 toolCallResponse("call-2", "register_vehicle_purchase"),
                 toolCallResponse("call-3", "set_payment_method"),
-                toolCallResponse("call-4", "send_purchase_status_email"),
-                textResponse("Flujo completado exitosamente"));
+                toolCallResponse("call-4", "send_purchase_status_email"));
 
         List<FlowExecutionEvent> events = new CopyOnWriteArrayList<>();
         CountDownLatch completed = new CountDownLatch(1);
@@ -105,7 +104,8 @@ class FlowServiceTest {
         assertEquals("COMPLETED", response.getStatus());
         assertEquals("execution-123", response.getId());
         assertNotNull(response.getTraceId());
-        assertEquals("Flujo completado exitosamente", response.getMessage());
+        assertTrue(response.getMessage().contains("se completó correctamente"),
+                "El cierre debe usar el resumen determinista");
         assertEquals("customer-001", response.getAttributes().get("customerId"));
 
         List<String> eventTypes = events.stream().map(FlowExecutionEvent::eventType).toList();
@@ -113,7 +113,7 @@ class FlowServiceTest {
         assertEquals(4, eventTypes.stream().filter("STEP_COMPLETED"::equals).count());
 
         ArgumentCaptor<Prompt> promptCaptor = ArgumentCaptor.forClass(Prompt.class);
-        verify(chatModel, times(5)).call(promptCaptor.capture());
+        verify(chatModel, times(4)).call(promptCaptor.capture());
 
         ToolCallingChatOptions firstOptions = assertInstanceOf(
                 ToolCallingChatOptions.class, promptCaptor.getAllValues().getFirst().getOptions());
@@ -121,24 +121,24 @@ class FlowServiceTest {
         assertEquals("get_vehicle_information",
                 firstOptions.getToolCallbacks().getFirst().getToolDefinition().name());
 
-        List<ToolResponseMessage> toolResponses = promptCaptor.getAllValues().get(4).getInstructions()
+        List<ToolResponseMessage> toolResponses = promptCaptor.getAllValues().getLast().getInstructions()
                 .stream()
                 .filter(ToolResponseMessage.class::isInstance)
                 .map(ToolResponseMessage.class::cast)
                 .toList();
-        assertEquals(4, toolResponses.size(), "El modelo debe recibir los resultados de las 4 tools");
+        assertEquals(3, toolResponses.size(),
+                "El último turno recibe los resultados previos; el cuarto paso ya no se reenvía al LLM");
         assertEquals("call-1", toolResponses.getFirst().getResponses().getFirst().id());
     }
 
     @Test
-    @DisplayName("debe completar el flujo si el LLM falla después de ejecutar todos los pasos")
-    void shouldCompleteFlowWhenLlmFailsAfterAllToolsCompleted() throws InterruptedException {
+    @DisplayName("no solicita un turno adicional al LLM cuando ya están todos los pasos obligatorios")
+    void shouldNotRequestExtraLlmTurnWhenAllToolsCompleted() throws InterruptedException {
         when(chatModel.call(any(Prompt.class))).thenReturn(
                 toolCallResponse("call-1", "get_vehicle_information"),
                 toolCallResponse("call-2", "register_vehicle_purchase"),
                 toolCallResponse("call-3", "set_payment_method"),
-                toolCallResponse("call-4", "send_purchase_status_email"))
-                .thenThrow(new IllegalStateException("CircuitBreaker 'llm' is OPEN"));
+                toolCallResponse("call-4", "send_purchase_status_email"));
 
         List<FlowExecutionEvent> events = new CopyOnWriteArrayList<>();
         CountDownLatch completed = new CountDownLatch(1);
@@ -153,10 +153,10 @@ class FlowServiceTest {
         FlowResponse response = service.createFlow(request());
 
         assertTrue(completed.await(5, TimeUnit.SECONDS),
-                "El flujo debe completarse aunque falle el turno final del LLM");
+                "El flujo debe completarse en cuanto terminan los pasos obligatorios");
         assertEquals("COMPLETED", response.getStatus());
-        assertNotNull(response.getMessage());
         assertTrue(response.getMessage().contains("se completó correctamente"));
+        verify(chatModel, times(4)).call(any(Prompt.class));
         assertTrue(events.stream().noneMatch(event -> "FLOW_FAILED".equals(event.eventType())),
                 "No debe publicarse FLOW_FAILED si los pasos de negocio ya terminaron");
     }
@@ -168,8 +168,7 @@ class FlowServiceTest {
                 toolCallResponse("call-1", "get_vehicle_information"),
                 toolCallResponse("call-2", "register_vehicle_purchase"),
                 toolCallResponse("call-3", "set_payment_method"),
-                toolCallResponse("call-4", "send_purchase_status_email"),
-                textResponse("Flujo completado exitosamente"));
+                toolCallResponse("call-4", "send_purchase_status_email"));
 
         List<FlowExecutionEvent> events = new CopyOnWriteArrayList<>();
         CountDownLatch completed = new CountDownLatch(1);
@@ -294,6 +293,7 @@ class FlowServiceTest {
         );
         AiService aiService = new AiService(chatModel, config, new ObjectMapper(),
                 new PiiMasker(), circuitBreakerRegistry, retryRegistry);
+        FlowStateManager stateManager = new FlowStateManager();
         return new FlowService(
                 WebClient.builder().build(),
                 aiService,
@@ -302,7 +302,8 @@ class FlowServiceTest {
                 flowDefinitions,
                 registry,
                 publisher,
-                new FlowStateManager(),
+                stateManager,
+                new FlowInterruptionHandler(publisher, stateManager, new UserFacingErrorMapper()),
                 new UserFacingErrorMapper(),
                 new PiiMasker(),
                 circuitBreakerRegistry,
@@ -399,10 +400,6 @@ class FlowServiceTest {
     private ChatResponse toolCallResponse(String callId, String toolName) {
         return chatResponse("", List.of(
                 new AssistantMessage.ToolCall(callId, "function", toolName, "{}")));
-    }
-
-    private ChatResponse textResponse(String content) {
-        return chatResponse(content, List.of());
     }
 
     private ChatResponse chatResponse(String content, List<AssistantMessage.ToolCall> toolCalls) {

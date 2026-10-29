@@ -17,6 +17,7 @@ public class FlowEventPublisher {
     private static final Logger log = LoggerFactory.getLogger(FlowEventPublisher.class);
     private static final int REPLAY_LIMIT = 100;
 
+    /** Buffer con replay de los últimos eventos para que un suscriptor tardío no pierda el progreso reciente. */
     private final Sinks.Many<FlowExecutionEvent> sink = Sinks.many().replay().limit(REPLAY_LIMIT);
 
     /**

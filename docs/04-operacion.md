@@ -150,6 +150,16 @@ curl -X POST http://localhost:8080/api/flows/exec-1/steps/2/retry
 
 Después hay que llamar a `resume` para que el flujo continúe.
 
+### Cancelar un flujo pausado
+
+```bash
+curl -X POST http://localhost:8080/api/flows/exec-1/cancel
+```
+
+Responde `200` con `status: CANCELLED` y `flowCode: FLOW_CANCELLED`. Si la
+ejecución no tiene estado almacenado responde `404`: no había nada que cancelar.
+El estado descartado ya no puede reanudarse.
+
 ### Consumir eventos SSE
 
 ```bash
@@ -171,7 +181,7 @@ Si `orchestrator.state.directory` no está vacío:
 - se crea el directorio al arrancar;
 - cada pausa/fallo se guarda como `<sha256(executionId)>.json`;
 - la escritura es atómica;
-- `resume` o `retry` consume el archivo (lo borra después de leerlo);
+- `resume`, `retry` o `cancel` consumen el archivo (lo borran después de leerlo);
 - un archivo corrupto se elimina y se registra el error.
 
 El archivo contiene los mensajes completos de la conversación, incluidos posibles

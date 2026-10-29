@@ -106,6 +106,16 @@ Importante: **retry no ejecuta el flujo**. Solo prepara el estado para que un
 `resume` posterior vuelva a intentar el paso. El cliente debe llamar a `resume`
 después.
 
+### `POST /api/flows/{id}/cancel`
+
+1. Recupera y descarta el estado pausado o fallido.
+2. Publica `FLOW_CANCELLED` con estado `CANCELLED` y flow code `FLOW_CANCELLED`.
+3. Responde `200` con `status = CANCELLED`; si no hay estado almacenado, `404`.
+
+Solo cancela ejecuciones detenidas (pausadas o fallidas): un flujo en ejecución
+no se interrumpe a mitad de una herramienta. Se usa cuando el operador rechaza
+una intervención humana, para que el estado no pueda reanudarse después.
+
 ## 3.4 Clase por clase
 
 ### `OrchestratorApplication`
@@ -184,6 +194,7 @@ trata como atributos de plantilla.
 | `/api/flows/async` | POST | Acepta el flujo y responde 202 |
 | `/api/flows/{executionId}/resume` | POST | Reanuda un flujo pausado; acepta `userInput` |
 | `/api/flows/{executionId}/steps/{stepOrder}/retry` | POST | Marca un paso para reintento |
+| `/api/flows/{executionId}/cancel` | POST | Cancela un flujo pausado/fallido y descarta su estado |
 | `/api/flows/stream` | GET | Stream SSE de eventos |
 | `/api/flows/health` | GET | Health simple |
 | `/api/health` | GET | Health simple alternativo |
@@ -457,14 +468,24 @@ mvn -o test -Dtest='!McpClientRegistryIntegrationTest'
 
 ## 3.7 Detalles y trampas conocidas
 
+Los puntos 2 y 3 se habían documentado como deuda técnica y ya están
+corregidos; abajo se describe el comportamiento actual.
+
 1. **El Control Center usa el endpoint síncrono.** El endpoint asíncrono existe,
    pero `WebClientOrchestratorClient.startFlow` sigue llamando a `/api/flows`.
    Para aprovecharlo hay que cambiar el cliente y adaptar el consumo de eventos.
-2. **La intervención reanuda sin datos.** `InterventionController` llama a
-   `resumeFlow(..., null)`. Si el dato faltante es del usuario, el agente volverá
-   a pedirlo. Hay que enviar `userInput` desde la pantalla.
-3. **Retry no ejecuta.** `retryStep` solo prepara el estado; requiere un `resume`
-   posterior.
+2. **La intervención reanuda con datos (corregido).** `InterventionController`
+   envía las notas del operador como `userInput` (`"APPROVED"` o
+   `"APPROVED. <notas>"`) y llama a `resumeOrRestartFlow`: si el Orchestrator
+   conserva el estado pausado, reanuda; si lo perdió (por ejemplo, tras un
+   reinicio), reinicia el flujo desde el principio en lugar de dejar el proceso
+   detenido con un 200 silencioso.
+3. **Retry valida antes de consumir el estado (corregido).** En el Orchestrator,
+   `retryStep` solo prepara el paso y la ejecución ocurre en la reanudación
+   posterior —el Control Center la hace en el mismo `retryProcess`—. La consulta
+   del estado pausado usa `FlowStateManager.peek`, así que un `stepOrder`
+   inexistente o un paso sin ejecución previa lanza error sin borrar el flujo
+   pausado.
 4. **`step=null` en algunas pausas.** `resetCurrentStep` limpia el paso después de
    cada tool. Si el LLM pide datos entre pasos, la pausa se registra sin paso.
 5. **`FlowStepExecution` no se usa.** Es un DTO legado; no confundirlo con las

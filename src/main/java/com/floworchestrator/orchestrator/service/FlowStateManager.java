@@ -74,6 +74,7 @@ public class FlowStateManager {
         return executionLocks.computeIfAbsent(executionId, k -> new ReentrantLock());
     }
 
+    /** Guarda el estado en memoria y, si hay directorio configurado, en disco antes de liberar el lock. */
     public void store(String executionId, PausedFlowState state) {
         ReentrantLock lock = lockFor(executionId);
         lock.lock();
@@ -85,6 +86,10 @@ public class FlowStateManager {
         }
     }
 
+    /**
+     * Recupera el estado y lo elimina (memoria y disco) para que solo una
+     * reanudación pueda consumirlo; devuelve {@code null} si no existe.
+     */
     public PausedFlowState retrieve(String executionId) {
         ReentrantLock lock = lockFor(executionId);
         lock.lock();
@@ -100,6 +105,23 @@ public class FlowStateManager {
         }
     }
 
+    /**
+     * Recupera el estado sin eliminarlo (primero de memoria y luego de disco),
+     * para validar una solicitud antes de modificarla. Devuelve {@code null} si
+     * no existe.
+     */
+    public PausedFlowState peek(String executionId) {
+        ReentrantLock lock = lockFor(executionId);
+        lock.lock();
+        try {
+            PausedFlowState state = states.get(executionId);
+            return state != null ? state : load(executionId);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Indica si hay un estado pausado en memoria o en disco, sin consumirlo. */
     public boolean hasState(String executionId) {
         ReentrantLock lock = lockFor(executionId);
         lock.lock();
@@ -111,6 +133,7 @@ public class FlowStateManager {
         }
     }
 
+    /** Ejecuta una acción bajo el lock de la ejecución para evitar reanudaciones concurrentes. */
     public <T> T withExecutionLock(String executionId, java.util.function.Supplier<T> action) {
         ReentrantLock lock = lockFor(executionId);
         lock.lock();
@@ -121,6 +144,7 @@ public class FlowStateManager {
         }
     }
 
+    /** Variante sin valor de retorno de {@link #withExecutionLock}. */
     public void runWithExecutionLock(String executionId, Runnable action) {
         ReentrantLock lock = lockFor(executionId);
         lock.lock();
@@ -209,6 +233,7 @@ public class FlowStateManager {
         }
     }
 
+    /** Estado de espera de una ejecución: definición del flujo, conversación completa y avance del agente. */
     public record PausedFlowState(
             String flowId,
             FlowDefinitions.FlowDefinition flowDefinition,
@@ -217,15 +242,20 @@ public class FlowStateManager {
     ) {
     }
 
+    /** Instantánea serializable de {@code AgentLoopState}; excluye el descubrimiento MCP, que se repite al reanudar. */
     public record AgentStateSnapshot(
             Set<String> completedTools,
             Set<String> failedTools,
             Map<String, Map<String, Object>> toolResults,
             int currentStepOrder,
-            String currentStep
+            String currentStep,
+            String pendingInterventionTool,
+            String pendingInterventionToolCallId,
+            Map<String, Object> pendingInterventionArguments
     ) {
     }
 
+    /** Envoltorio con versión de esquema que se escribe en el archivo JSON de estado. */
     public record PersistedFlowState(
             int version,
             String executionId,
@@ -251,7 +281,8 @@ public class FlowStateManager {
                     messages == null ? List.of() : messages,
                     FlowService.AgentLoopState.fromSnapshot(
                             agentState == null
-                                    ? new AgentStateSnapshot(Set.of(), Set.of(), Map.of(), 0, null)
+                                    ? new AgentStateSnapshot(Set.of(), Set.of(), Map.of(), 0, null,
+                                            null, null, null)
                                     : agentState));
         }
     }

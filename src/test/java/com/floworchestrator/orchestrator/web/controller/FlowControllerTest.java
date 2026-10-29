@@ -2,6 +2,7 @@ package com.floworchestrator.orchestrator.web.controller;
 
 import com.floworchestrator.orchestrator.model.FlowAsyncAccepted;
 import com.floworchestrator.orchestrator.model.FlowRequest;
+import com.floworchestrator.orchestrator.model.FlowResponse;
 import com.floworchestrator.orchestrator.service.FlowService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -30,6 +31,38 @@ class FlowControllerTest {
 
         assertEquals(HttpStatus.ACCEPTED, response.getStatusCode());
         assertEquals("exec-1", response.getBody().executionId());
+    }
+
+    @Test
+    @DisplayName("debe responder 200 con estado CANCELLED al cancelar una ejecución")
+    void shouldReturnCancelledWhenCancelling() {
+        FlowService flowService = mock(FlowService.class);
+        FlowResponse cancelled = new FlowResponse();
+        cancelled.setId("exec-1");
+        cancelled.setStatus("CANCELLED");
+        when(flowService.cancelFlow("exec-1")).thenReturn(cancelled);
+
+        FlowController controller = new FlowController(flowService);
+
+        ResponseEntity<FlowResponse> response = controller.cancelFlow("exec-1");
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        assertEquals("CANCELLED", response.getBody().getStatus());
+        assertEquals("exec-1", response.getBody().getId());
+    }
+
+    @Test
+    @DisplayName("debe responder 404 al cancelar sin estado almacenado")
+    void shouldReturnNotFoundWhenCancellingUnknownExecution() {
+        FlowService flowService = mock(FlowService.class);
+        when(flowService.cancelFlow("exec-missing"))
+                .thenThrow(new IllegalStateException("sin estado"));
+
+        FlowController controller = new FlowController(flowService);
+
+        ResponseEntity<FlowResponse> response = controller.cancelFlow("exec-missing");
+
+        assertEquals(HttpStatus.NOT_FOUND, response.getStatusCode());
     }
 
     @Test

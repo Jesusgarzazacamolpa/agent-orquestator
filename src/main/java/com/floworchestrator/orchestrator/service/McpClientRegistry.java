@@ -18,6 +18,10 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 
+/**
+ * Implementación de {@link McpToolClient}: mantiene un cliente MCP síncrono por
+ * servidor, descubre sus herramientas y recrea la sesión cuando se invalida.
+ */
 @Component
 public class McpClientRegistry implements McpToolClient {
     private static final Logger log = LoggerFactory.getLogger(McpClientRegistry.class);
@@ -31,6 +35,7 @@ public class McpClientRegistry implements McpToolClient {
         this.objectMapper = objectMapper;
     }
 
+    /** Lista las herramientas publicadas por el servidor MCP para validar y ofrecer sus esquemas. */
     @Override
     public List<DiscoveredTool> listTools(String serverName) {
         return withRetry(serverName, client -> client.listTools().tools().stream()
@@ -38,6 +43,10 @@ public class McpClientRegistry implements McpToolClient {
                 .toList());
     }
 
+    /**
+     * Invoca una herramienta y devuelve su resultado como mapa; si la tool reporta
+     * error lanza {@link McpToolException} con su código y si es reintentable.
+     */
     @Override
     public Map<String, Object> callTool(String serverName, String toolName, Map<String, Object> arguments) {
         return withRetry(serverName, client -> {
@@ -61,6 +70,10 @@ public class McpClientRegistry implements McpToolClient {
                 errorCode, retryable, payload);
     }
 
+    /**
+     * Ejecuta la operación contra el cliente y, si la sesión se rompe, la recrea y
+     * reintenta una vez; los errores de negocio se propagan sin reintento.
+     */
     private <T> T withRetry(String serverName, Function<McpSyncClient, T> operation) {
         try {
             return operation.apply(client(serverName));
@@ -124,6 +137,7 @@ public class McpClientRegistry implements McpToolClient {
         }
     }
 
+    /** Cierra todos los clientes MCP durante el apagado del servicio. */
     @PreDestroy
     public void closeClients() {
         clients.values().forEach(client -> {

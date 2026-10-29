@@ -5,6 +5,10 @@ import lombok.NoArgsConstructor;
 
 import java.time.OffsetDateTime;
 
+/**
+ * Registro del avance de un paso del flujo (orden, estado, reintentos y marcas
+ * de tiempo); se usa para bitácora y para el reintento de pasos fallidos.
+ */
 @Data
 @NoArgsConstructor
 public class FlowStepExecution {

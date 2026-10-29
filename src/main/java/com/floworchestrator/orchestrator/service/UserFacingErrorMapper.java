@@ -7,10 +7,15 @@ import org.springframework.stereotype.Component;
 import java.util.Map;
 import java.util.regex.Pattern;
 
+/**
+ * Traduce errores técnicos (texto de la herramienta o del servidor) a un mensaje
+ * amigable con título, acción sugerida, tipo de estado y código de error para la UI.
+ */
 @Component
 @Slf4j
 public class UserFacingErrorMapper {
 
+    /** Categorías de error reconocidas por expresión regular; {@code DEFAULT} se usa como último recurso. */
     @Getter
     public enum ErrorPattern {
         TIMEOUT(".*timeout.*", "timeout", "warning",
@@ -74,6 +79,7 @@ public class UserFacingErrorMapper {
             this.actionLabel = actionLabel;
         }
 
+        /** Indica si el error dado coincide con el patrón de esta categoría. */
         public boolean matches(String error) {
             return pattern.matcher(error != null ? error : "").matches();
         }
@@ -88,6 +94,10 @@ public class UserFacingErrorMapper {
         "verify_tax_id", ErrorPattern.SAT_TIMEOUT
     );
 
+    /**
+     * Clasifica el error: primero prueba el patrón específico de la herramienta,
+     * luego los genéricos y, si nada coincide, devuelve el mapeo por defecto.
+     */
     public ErrorMapping mapError(String toolName, String server, String rawError) {
         String context = (rawError != null ? rawError : "") + " " + (server != null ? server : "");
 
@@ -117,6 +127,7 @@ public class UserFacingErrorMapper {
         );
     }
 
+    /** Datos de presentación del error que viajan en la respuesta y en el evento SSE. */
     public record ErrorMapping(
         String errorCode,
         String title,

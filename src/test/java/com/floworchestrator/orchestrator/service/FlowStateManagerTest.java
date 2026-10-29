@@ -71,6 +71,25 @@ class FlowStateManagerTest {
         FlowStateManager manager = new FlowStateManager();
         assertFalse(manager.hasState("nonexistent"));
         assertNull(manager.retrieve("nonexistent"));
+        assertNull(manager.peek("nonexistent"));
+    }
+
+    @Test
+    @DisplayName("peek debe devolver el estado sin consumirlo")
+    void shouldPeekWithoutConsumingState() {
+        FlowStateManager manager = new FlowStateManager();
+        String executionId = "exec-peek";
+        FlowDefinitions.FlowDefinition flow = new FlowDefinitions.FlowDefinition();
+        flow.setProcessTemplateName("flujo-peek");
+        manager.store(executionId, new FlowStateManager.PausedFlowState(
+                "flujo-peek", flow, List.of(), new FlowService.AgentLoopState()));
+
+        assertEquals("flujo-peek", manager.peek(executionId).flowDefinition().getProcessTemplateName());
+        assertEquals("flujo-peek", manager.peek(executionId).flowDefinition().getProcessTemplateName());
+        assertTrue(manager.hasState(executionId), "peek no debe eliminar el estado");
+
+        assertNotNull(manager.retrieve(executionId));
+        assertFalse(manager.hasState(executionId));
     }
 
     @Test

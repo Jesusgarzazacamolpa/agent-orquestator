@@ -21,6 +21,10 @@ public class FlowStreamController {
 
     private final FlowEventPublisher flowEventPublisher;
 
+    /**
+     * GET /api/flows/stream: stream SSE con todos los eventos de ejecución; cada
+     * evento lleva el tipo como nombre y un id `executionId-timestamp`.
+     */
     @GetMapping(value = "/flows/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<ServerSentEvent<FlowExecutionEvent>> stream() {
         return flowEventPublisher.stream()

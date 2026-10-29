@@ -107,6 +107,7 @@ El orquestador devuelve un `FlowResponse.status` y, para errores, un `flowCode`.
 | `COMPLETED` | Todas las tools requeridas se ejecutaron y el LLM dio un cierre |
 | `PAUSED_FOR_HUMAN` | Se necesita información del usuario o una tool pidió intervención |
 | `FAILED` | Error de negocio, de tool o de configuración; puede reintentarse |
+| `CANCELLED` | El flujo se canceló y su estado se descartó; no puede reanudarse |
 | `ERR_FLOW_01` | Error genérico del flujo |
 | `ERR_FLOW_START` | El flujo asíncrono no pudo arrancar |
 | `ERR_LLM_01` | LLM no disponible tras timeouts/reintentos/circuito abierto |
@@ -123,7 +124,7 @@ El modo síncrono es el que usa hoy el Control Center
 El asíncrono está disponible para clientes que no quieran mantener una conexión
 abierta durante minutos; el progreso se sigue por SSE con el `traceId` devuelto.
 
-## Pausa, reanudación y reintento
+## Pausa, reanudación, reintento y cancelación
 
 1. El agente termina un turno pidiendo datos al usuario, o una tool responde
    `requiresIntervention`.
@@ -134,6 +135,12 @@ abierta durante minutos; el progreso se sigue por SSE con el `traceId` devuelto.
    enviar `userInput` con el dato que faltaba.
 5. Si se reintenta un paso, primero se marca con
    `POST /api/flows/{id}/steps/{order}/retry`; después se reanuda la ejecución.
+6. Si el operador rechaza la intervención, el Control Center marca el proceso
+   como cancelado; `POST /api/flows/{id}/cancel` descarta el estado del
+   orquestador para que el flujo no pueda reanudarse.
+7. El `FLOW_CANCELLED` resultante lo consume el Control Center: si la ejecución
+   aún no estaba cancelada la marca con los datos del evento y deja de seguirla;
+   si ya estaba cancelada, conserva el mensaje específico del rechazo.
 
 El estado se conserva en memoria y, si `orchestrator.state.directory` no está
 vacío, también en disco (`.flow-state/`). Así el `resume` sobrevive a un reinicio.

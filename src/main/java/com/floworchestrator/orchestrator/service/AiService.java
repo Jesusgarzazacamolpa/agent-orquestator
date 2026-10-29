@@ -90,6 +90,10 @@ public class AiService {
         this.llmExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
 
+    /**
+     * Ejecuta un turno del agente contra Ollama y devuelve el texto y las tool calls
+     * del modelo; si el LLM falla devuelve una respuesta degradada en lugar de lanzar.
+     */
     public AiResponse generateResponse(List<Map<String, Object>> conversation,
                                        List<ToolSpec> availableTools,
                                        String traceId,
@@ -134,6 +138,7 @@ public class AiService {
         return AiResponse.success(content, toolCalls);
     }
 
+    /** Arma el prompt desactivando la ejecución interna de tools para que el orquestador decida cuándo invocarlas. */
     private Prompt buildPrompt(List<Map<String, Object>> conversation, List<ToolSpec> availableTools) {
         ToolCallingChatOptions.Builder options = ToolCallingChatOptions.builder()
                 .model(config.ollamaModel())
@@ -146,6 +151,10 @@ public class AiService {
         return new Prompt(toMessages(conversation), options.build());
     }
 
+    /**
+     * Llama al modelo en un hilo virtual y corta la espera con {@code llmTimeout};
+     * el timeout lanza {@link IllegalStateException} para que retry y circuit breaker lo cuenten.
+     */
     private ChatResponse callWithTimeout(Prompt prompt) {
         CompletableFuture<ChatResponse> future =
                 CompletableFuture.supplyAsync(() -> chatModel.call(prompt), llmExecutor);
@@ -174,6 +183,7 @@ public class AiService {
         return response.getResult().getOutput();
     }
 
+    /** Traduce el historial propio del orquestador (role/content) a mensajes de Spring AI. */
     private List<Message> toMessages(List<Map<String, Object>> conversation) {
         List<Message> messages = new ArrayList<>();
         if (conversation == null) {
@@ -192,6 +202,7 @@ public class AiService {
         return messages;
     }
 
+    /** Reconstruye el mensaje assistant con sus tool calls para que el historial enviado a Ollama sea válido. */
     private AssistantMessage toAssistantMessage(Map<String, Object> rawMessage, String content) {
         List<AssistantMessage.ToolCall> toolCalls = new ArrayList<>();
         if (rawMessage.get("tool_calls") instanceof List<?> rawCalls) {
@@ -224,6 +235,7 @@ public class AiService {
         return new AiToolCall(id, toolCall.name(), parseArguments(toolCall.arguments(), toolCall.name()));
     }
 
+    /** Convierte los argumentos JSON de una tool call; si vienen malformados devuelve vacío para que el orquestador valide y corrija. */
     private Map<String, Object> parseArguments(String rawArguments, String toolName) {
         if (rawArguments == null || rawArguments.isBlank()) {
             return Map.of();
@@ -252,6 +264,10 @@ public class AiService {
         return callbacks;
     }
 
+    /**
+     * Expone la tool al modelo solo como esquema: si el LLM intentara ejecutarla
+     * internamente, {@code call} falla porque la ejecución pertenece al orquestador.
+     */
     private ToolCallback toToolCallback(ToolSpec tool) {
         String inputSchema = tool.inputSchema() == null || tool.inputSchema().isEmpty()
                 ? "{\"type\":\"object\",\"properties\":{}}"
@@ -275,6 +291,7 @@ public class AiService {
         };
     }
 
+    /** Acumula y registra el consumo de tokens por llamada, por flujo y global. */
     private TokenUsage auditTokens(ChatResponse response, String flowId, String traceId) {
         Usage usage = response.getMetadata() == null ? null : response.getMetadata().getUsage();
         long promptTokens = usage == null || usage.getPromptTokens() == null ? 0 : usage.getPromptTokens();
@@ -294,14 +311,17 @@ public class AiService {
         return callUsage;
     }
 
+    /** Devuelve el consumo acumulado de un flujo, o {@code null} si aún no ha llamado al LLM. */
     public TokenUsage getTokenUsage(String flowId) {
         return tokenUsageByFlow.get(flowId);
     }
 
+    /** Total de tokens de prompt consumidos desde el arranque del servicio. */
     public long getTotalPromptTokens() {
         return totalPromptTokens.get();
     }
 
+    /** Total de tokens generados por el modelo desde el arranque del servicio. */
     public long getTotalGenerationTokens() {
         return totalGenerationTokens.get();
     }
@@ -342,11 +362,16 @@ public class AiService {
         return cause.getClass().getSimpleName() + (message == null ? "" : ": " + message);
     }
 
+    /** Cierra el executor de hilos virtuales usado para las llamadas al LLM. */
     @PreDestroy
     public void shutdown() {
         llmExecutor.shutdownNow();
     }
 
+    /**
+     * Resultado de un turno del LLM. Un {@code degraded} indica que el proveedor
+     * falló y el flujo debe detenerse o cerrarse con un mensaje de respaldo.
+     */
     public record AiResponse(String content,
                              List<AiToolCall> toolCalls,
                              boolean degraded,
@@ -361,15 +386,18 @@ public class AiService {
                     : Collections.unmodifiableList(new ArrayList<>(toolCalls));
         }
 
+        /** Respuesta válida del modelo con su contenido y las llamadas a herramientas solicitadas. */
         public static AiResponse success(String content, List<AiToolCall> toolCalls) {
             return new AiResponse(content, toolCalls, false, null, null, null);
         }
 
+        /** Respuesta de respaldo cuando el LLM no está disponible; transporta el código y el mensaje para el usuario. */
         public static AiResponse degraded(String flowCode, String userMessage, String userAction) {
             return new AiResponse("", List.of(), true, flowCode, userMessage, userAction);
         }
     }
 
+    /** Llamada a herramienta solicitada por el modelo, ya con argumentos normalizados a mapa. */
     public record AiToolCall(String id, String name, Map<String, Object> arguments) {
 
         public AiToolCall {
@@ -379,9 +407,11 @@ public class AiService {
         }
     }
 
+    /** Herramienta ofrecida al modelo: nombre, descripción y JSON Schema de sus argumentos. */
     public record ToolSpec(String name, String description, Map<String, Object> inputSchema) {
     }
 
+    /** Consumo de tokens de una llamada o de un flujo, con utilidades de suma. */
     public record TokenUsage(long promptTokens, long generationTokens) {
 
         public long totalTokens() {

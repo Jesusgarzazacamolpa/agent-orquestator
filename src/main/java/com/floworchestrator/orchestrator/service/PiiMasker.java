@@ -31,6 +31,7 @@ public class PiiMasker {
                     "[PHONE_REDACTED]")
     );
 
+    /** Enmascara correos, CURP, RFC, cuentas, tarjetas y teléfonos en un texto libre. */
     public String mask(String text) {
         if (text == null || text.isEmpty()) {
             return text;
@@ -42,6 +43,7 @@ public class PiiMasker {
         return masked;
     }
 
+    /** Aplica el enmascarado recursivamente a los valores de un mapa (mapas y listas anidados). */
     public Map<String, Object> maskMap(Map<String, Object> source) {
         if (source == null) {
             return Map.of();

@@ -53,6 +53,9 @@ class FlowStateManagerPersistenceTest {
         assertEquals(3, agentState.currentStepOrder());
         assertEquals("Configurar pago", agentState.currentStep());
         assertEquals("ok", agentState.toolResults().get("get_vehicle_information").get("result"));
+        assertEquals("request_financing_approval", agentState.pendingInterventionTool());
+        assertEquals("call-fin-1", agentState.pendingInterventionToolCallId());
+        assertEquals("po-1", agentState.pendingInterventionArguments().get("purchase_order_id"));
 
         assertFalse(restarted.hasState(executionId), "El estado debe consumirse al recuperarlo");
         assertEquals(0, jsonFiles().size(), "El archivo debe eliminarse tras el retrieve");
@@ -121,7 +124,10 @@ class FlowStateManagerPersistenceTest {
                         Set.of("set_payment_method"),
                         Map.of("get_vehicle_information", Map.of("result", "ok")),
                         3,
-                        "Configurar pago"));
+                        "Configurar pago",
+                        "request_financing_approval",
+                        "call-fin-1",
+                        Map.of("purchase_order_id", "po-1")));
 
         return new FlowStateManager.PausedFlowState(
                 "compra-vehiculo",

@@ -20,9 +20,17 @@ import reactor.netty.http.client.HttpClient;
 
 import java.time.Duration;
 
+/**
+ * Cablea la infraestructura del orquestador: límites del agente, cliente de
+ * Ollama y WebClient hacia Control Center con sus timeouts.
+ */
 @Configuration
 public class OrchestratorConfiguration {
 
+    /**
+     * Construye los límites y timeouts del servicio a partir de las propiedades
+     * {@code ollama.*}, {@code mcp.*} y {@code services.control-center.*}.
+     */
     @Bean
     public FlowServiceConfig flowServiceConfig(
             @Value("${services.control-center.base-url:http://localhost:8081}") String controlCenterBaseUrl,
@@ -60,6 +68,10 @@ public class OrchestratorConfiguration {
         );
     }
 
+    /**
+     * Crea el modelo de chat de Ollama con inferencia determinista y ejecución
+     * interna de herramientas desactivada (las tools MCP las ejecuta el orquestador).
+     */
     @Bean
     public ChatModel chatModel(
             RestClient.Builder restClientBuilder,
@@ -96,6 +108,10 @@ public class OrchestratorConfiguration {
                 .build();
     }
 
+    /**
+     * Crea el WebClient hacia Control Center con timeout de conexión y de
+     * respuesta, usado para resolver plantillas y crear ejecuciones de proceso.
+     */
     @Bean
     public WebClient orchestratorWebClient(WebClient.Builder builder,
             @Value("${services.control-center.timeout-seconds:10}") long timeoutSeconds) {

@@ -12,6 +12,7 @@ public record FlowAsyncAccepted(
         String traceId,
         String status
 ) {
+    /** Crea la respuesta 202 con estado {@code ACCEPTED} para un flujo aceptado en segundo plano. */
     public static FlowAsyncAccepted accepted(String requestId, String flowId,
                                              String executionId, String traceId) {
         return new FlowAsyncAccepted(requestId, flowId, executionId, traceId, "ACCEPTED");

@@ -1,9 +1,9 @@
 # Orchestrator - Orquestador de flujos IA
 
-Servicio Java 21 + Spring Boot que coordina un agente LLM local (Ollama) para
-ejecutar flujos de negocio mediante herramientas MCP. El LLM decide el siguiente
-paso; el orquestador valida, ejecuta, registra y pausa cuando hace falta una
-persona.
+Servicio Java 21 + Spring Boot que coordina un agente LLM (Ollama local u OpenAI)
+para ejecutar flujos de negocio mediante herramientas MCP. El LLM decide el
+siguiente paso; el orquestador valida, ejecuta, registra y pausa cuando hace
+falta una persona.
 
 ## Qué hace
 
@@ -18,11 +18,17 @@ persona.
 ## Inicio rápido
 
 ```bash
-# Requisitos: JDK 21+, Maven 3.9+, Ollama con qwen2.5:7b
+# Requisitos: JDK 21+, Maven 3.9+, y Ollama con qwen2.5:7b u OPENAI_API_KEY
 ollama pull qwen2.5:7b
 
 mvn -o package -DskipTests
+
+# Proveedor local (por defecto)
 "$JAVA_HOME/bin/java" -jar target/orchestrator-0.1.0.jar
+
+# Alternativa remota con OpenAI
+export OPENAI_API_KEY=sk-...
+"$JAVA_HOME/bin/java" -jar target/orchestrator-0.1.0.jar --llm.provider=openai
 
 curl http://localhost:8080/actuator/health
 ```
@@ -51,7 +57,7 @@ La guía completa está en [docs/](docs/README.md):
 ## Arquitectura en una línea
 
 ```text
-Frontends -> Control Center -> Orchestrator -> Ollama
+Frontends -> Control Center -> Orchestrator -> Ollama/OpenAI
                                    |-> mcp-domain -> vehicle-domain-service
                                    |-> mcp-notifications
                                    \-> SSE -> Control Center

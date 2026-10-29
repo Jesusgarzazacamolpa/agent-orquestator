@@ -91,8 +91,9 @@ public class AiService {
     }
 
     /**
-     * Ejecuta un turno del agente contra Ollama y devuelve el texto y las tool calls
-     * del modelo; si el LLM falla devuelve una respuesta degradada en lugar de lanzar.
+     * Ejecuta un turno del agente contra el proveedor configurado (Ollama u
+     * OpenAI) y devuelve el texto y las tool calls del modelo; si el LLM falla
+     * devuelve una respuesta degradada en lugar de lanzar.
      */
     public AiResponse generateResponse(List<Map<String, Object>> conversation,
                                        List<ToolSpec> availableTools,
@@ -131,7 +132,7 @@ public class AiService {
 
         log.info("[AI] Respuesta del LLM: traceId={}, flowId={}, model={}, toolCalls={}, "
                         + "promptTokens={}, generationTokens={}, durationMs={}, content={}",
-                traceId, flowId, config.ollamaModel(), toolCalls.size(),
+                traceId, flowId, config.llmModel(), toolCalls.size(),
                 usage.promptTokens(), usage.generationTokens(),
                 (System.nanoTime() - startedAt) / 1_000_000, piiMasker.mask(content));
 
@@ -141,7 +142,7 @@ public class AiService {
     /** Arma el prompt desactivando la ejecución interna de tools para que el orquestador decida cuándo invocarlas. */
     private Prompt buildPrompt(List<Map<String, Object>> conversation, List<ToolSpec> availableTools) {
         ToolCallingChatOptions.Builder options = ToolCallingChatOptions.builder()
-                .model(config.ollamaModel())
+                .model(config.llmModel())
                 .temperature(TEMPERATURE)
                 .topP(TOP_P)
                 .internalToolExecutionEnabled(false);
@@ -202,7 +203,7 @@ public class AiService {
         return messages;
     }
 
-    /** Reconstruye el mensaje assistant con sus tool calls para que el historial enviado a Ollama sea válido. */
+    /** Reconstruye el mensaje assistant con sus tool calls para que el historial enviado al modelo sea válido. */
     private AssistantMessage toAssistantMessage(Map<String, Object> rawMessage, String content) {
         List<AssistantMessage.ToolCall> toolCalls = new ArrayList<>();
         if (rawMessage.get("tool_calls") instanceof List<?> rawCalls) {
@@ -306,7 +307,7 @@ public class AiService {
 
         log.info("[AI-TOKENS] traceId={}, flowId={}, model={}, promptTokens={}, generationTokens={}, "
                         + "callTotalTokens={}, flowTotalTokens={}",
-                traceId, flowId, config.ollamaModel(), promptTokens, generationTokens,
+                traceId, flowId, config.llmModel(), promptTokens, generationTokens,
                 callUsage.totalTokens(), flowUsage.totalTokens());
         return callUsage;
     }

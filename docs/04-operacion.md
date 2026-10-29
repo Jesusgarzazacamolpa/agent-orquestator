@@ -6,7 +6,8 @@
 |---|---|
 | JDK | 21 o superior para ejecutar; 25 funciona en local con el flag de Byte Buddy que ya está en `pom.xml` |
 | Maven | 3.9+ |
-| Ollama | Con el modelo descargado (`ollama pull qwen2.5:7b`) |
+| Ollama | Con el modelo descargado (`ollama pull qwen2.5:7b`); no hace falta si `llm.provider=openai` |
+| OpenAI | Opcional: `OPENAI_API_KEY` y salida a `api.openai.com` si `llm.provider=openai` |
 | Node.js | 20+ solo si vas a ejecutar `mcp-notifications` o los frontends |
 | PostgreSQL | 15+ si usas el Control Center o el dominio de vehículos |
 
@@ -45,7 +46,9 @@ curl http://localhost:8080/api/health
 ```
 
 Si usas el `docker-compose.yml` raíz, Ollama debe estar corriendo en el host y el
-contenedor lo busca en `host.docker.internal:11434`.
+contenedor lo busca en `host.docker.internal:11434`. Para usar OpenAI basta con
+exportar `LLM_PROVIDER=openai` y `OPENAI_API_KEY` en el host antes de
+`docker compose up`.
 
 ## 4.3 Configuración principal
 
@@ -54,11 +57,16 @@ Archivo: [application.yml](../src/main/resources/application.yml).
 | Propiedad | Valor por defecto | Para qué |
 |---|---|---|
 | `server.port` | `8080` | Puerto HTTP |
+| `llm.provider` | `ollama` | Proveedor de chat activo: `ollama` u `openai` |
 | `ollama.base-url` | `http://localhost:11434` | API de Ollama |
-| `ollama.model` | `qwen2.5:7b` | Modelo usado |
+| `ollama.model` | `qwen2.5:7b` | Modelo usado con Ollama |
 | `ollama.max-agent-turns` | `8` | Máximo de turnos del agente |
 | `ollama.max-context-messages` | `20` | Mensajes máximos enviados al LLM |
-| `ollama.timeout-seconds` | `120` | Timeout lógico por llamada |
+| `ollama.timeout-seconds` | `180` | Timeout lógico por llamada con Ollama |
+| `openai.api-key` | `${OPENAI_API_KEY}` (vacío) | API key; obligatoria si `llm.provider=openai` |
+| `openai.base-url` | `https://api.openai.com` | API de OpenAI o proxy compatible |
+| `openai.model` | `gpt-4o-mini` | Modelo usado con OpenAI |
+| `openai.timeout-seconds` | `60` | Timeout lógico por llamada con OpenAI |
 | `ollama.max-retries` | `3` | Reintentos configurados en `FlowServiceConfig` |
 | `ollama.retry-wait-seconds` | `2` | Espera base entre reintentos |
 | `mcp.max-retries` | `2` | Reintentos por tool MCP |
@@ -70,11 +78,17 @@ Archivo: [application.yml](../src/main/resources/application.yml).
 | `services.mcp-domain.base-url` | `http://localhost:9001` | MCP de dominio |
 | `services.mcp-notifications.base-url` | `http://localhost:9002` | MCP de notificaciones |
 
+Las propiedades de turnos, contexto, reintentos y umbrales conservan el prefijo
+`ollama.*` por compatibilidad, pero aplican al proveedor activo.
+
 Variables de entorno útiles (Spring aplica *relaxed binding*):
 
 ```bash
+export LLM_PROVIDER=ollama          # o openai
 export OLLAMA_BASE_URL=http://localhost:11434
 export OLLAMA_MODEL=qwen2.5:7b
+export OPENAI_API_KEY=sk-...        # obligatoria si LLM_PROVIDER=openai
+export OPENAI_MODEL=gpt-4o-mini
 export SERVICES_CONTROL_CENTER_BASE_URL=http://localhost:8081
 export SERVICES_MCP_DOMAIN_BASE_URL=http://localhost:9001
 export SERVICES_MCP_NOTIFICATIONS_BASE_URL=http://localhost:9002
@@ -95,8 +109,10 @@ En `resilience4j.retry.instances.llm`:
 - backoff exponencial (2 s, factor 2, máximo 10 s);
 - solo se reintentan errores transitorios de red/servicio.
 
-Los valores están ajustados a la latencia de Ollama local. Si cambias de modelo o
-de proveedor, revisa `slow-call-duration-threshold` y los timeouts.
+Los valores están ajustados a la latencia de Ollama local. Si cambias de modelo
+o de proveedor (por ejemplo a OpenAI), revisa `slow-call-duration-threshold` y
+el timeout del proveedor activo (`ollama.timeout-seconds` u
+`openai.timeout-seconds`).
 
 ## 4.4 Endpoints
 
@@ -221,8 +237,9 @@ grep 'traceId=f49e434b' orchestrator.log
 
 Síntomas: `ERR_LLM_01`, `CallNotPermittedException`, logs `[AI-FAIL]`.
 
-- Verifica que Ollama responde: `curl http://localhost:11434/api/tags`.
-- Comprueba que el modelo está descargado.
+- Verifica que el proveedor responde: `curl http://localhost:11434/api/tags` con
+  Ollama, o que `OPENAI_API_KEY` es válida y hay salida a `api.openai.com`.
+- Comprueba que el modelo está descargado o existe en el proveedor.
 - Ajusta `ollama.timeout-seconds` y los umbrales de slow-call a la latencia real.
 - El circuito se reabre solo después de `wait-duration-in-open-state`.
 

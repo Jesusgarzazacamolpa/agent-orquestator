@@ -25,6 +25,10 @@ services:
   mcp-notifications:
     base-url: http://localhost:9002
 
+llm:
+  # Proveedor activo del modelo de chat: ollama (local) u openai (API remota).
+  provider: ollama
+
 ollama:
   base-url: http://localhost:11434
   model: qwen2.5:7b
@@ -45,6 +49,16 @@ ollama:
   retry-wait-seconds: 2
   circuit-breaker-threshold: 50
   circuit-breaker-reset-seconds: 60
+
+openai:
+  # Solo se exige al arrancar cuando llm.provider=openai; se inyecta por entorno.
+  api-key: ${OPENAI_API_KEY:}
+  base-url: https://api.openai.com
+  model: gpt-4o-mini
+  temperature: 0.0
+  top-p: 0.1
+  # API remota: no necesita el margen de 180s del modelo local en CPU.
+  timeout-seconds: 60
 
 mcp:
   max-retries: 2

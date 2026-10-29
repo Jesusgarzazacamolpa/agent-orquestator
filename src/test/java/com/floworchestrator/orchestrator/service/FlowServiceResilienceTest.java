@@ -132,7 +132,7 @@ class FlowServiceResilienceTest {
     private FlowServiceConfig config(int maxMcpRetries) {
         return new FlowServiceConfig(
                 "http://localhost:8081",
-                "http://localhost:11434",
+                "ollama",
                 "qwen2.5:7b",
                 3,
                 maxMcpRetries,

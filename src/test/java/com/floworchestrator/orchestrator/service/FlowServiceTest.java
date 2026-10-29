@@ -276,7 +276,7 @@ class FlowServiceTest {
     private FlowService buildService(McpToolClient registry, int maxAgentTurns) {
         FlowServiceConfig config = new FlowServiceConfig(
                 baseUrl(controlCenter),
-                "http://localhost:11434",
+                "ollama",
                 "qwen2.5:7b",
                 maxAgentTurns,
                 0,

@@ -50,7 +50,7 @@ flowchart TD
     FS --> UFE["UserFacingErrorMapper"]
     FS --> PII["PiiMasker"]
     FS --> FD["FlowDefinitions"]
-    AI --> CM["ChatModel (Ollama)"]
+    AI --> CM["ChatModel (Ollama/OpenAI)"]
     AI --> PII
     AI --> CB["Resilience4j"]
     FS --> CB
@@ -155,7 +155,8 @@ no requiere tocar Java.
 Declara tres beans:
 
 1. `flowServiceConfig`: traduce propiedades sueltas a un record tipado.
-2. `chatModel`: construye `OllamaChatModel` con timeouts reales, opciones por
+2. `chatModel`: construye el `ChatModel` del proveedor activo
+   (`OllamaChatModel` u `OpenAiChatModel`) con timeouts reales, opciones por
    defecto y `ToolCallingManager`.
 3. `orchestratorWebClient`: `WebClient` con timeout de conexión y respuesta para
    hablar con el Control Center.
@@ -451,13 +452,19 @@ mvn -o test -Dtest='!McpClientRegistryIntegrationTest'
 4. Verificar que los servidores MCP estén en `orchestrator.mcp-servers`.
 5. Probar con `POST /api/flows`.
 
-### Cambiar el modelo o la latencia
+### Cambiar el proveedor, el modelo o la latencia
 
-- Modelo: `ollama.model` o variable `OLLAMA_MODEL`.
-- URL: `ollama.base-url` o `OLLAMA_BASE_URL`.
-- Timeout: `ollama.timeout-seconds`.
+- Proveedor: `llm.provider` (`ollama` u `openai`) o variable `LLM_PROVIDER`.
+  Con `openai` se exige `OPENAI_API_KEY` y se ignora la configuración de Ollama.
+- Modelo: `ollama.model` / `OLLAMA_MODEL` u `openai.model` / `OPENAI_MODEL`,
+  según el proveedor activo.
+- URL de Ollama: `ollama.base-url` o `OLLAMA_BASE_URL`.
+- Timeout: `ollama.timeout-seconds` u `openai.timeout-seconds`.
 - Turnos: `ollama.max-agent-turns`.
 - Contexto: `ollama.max-context-messages`.
+
+Los límites de turnos, contexto, reintentos y umbrales conservan el prefijo
+`ollama.*`, pero aplican a cualquiera de los dos proveedores.
 
 ### Ajustar resiliencia
 

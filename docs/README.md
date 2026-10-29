@@ -28,7 +28,7 @@ orquestador-flujos-ia/
 ├── docker-compose.yml            Levanta todos los servicios
 ├── frontend/                     App Shell, Flow Portal, Flow Viewer e Intervención
 └── services/
-    ├── orchestrator/             Este servicio (Java + Spring AI + Ollama)
+    ├── orchestrator/             Este servicio (Java + Spring AI + Ollama/OpenAI)
     ├── control-center/           Estado, bitácora e intervención humana (Java)
     ├── mcp-domain/              Herramientas MCP de negocio (Java)
     ├── mcp-notifications/       Herramienta MCP de correo (Node.js)

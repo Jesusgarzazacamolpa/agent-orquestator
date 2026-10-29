@@ -188,7 +188,7 @@ class AiServiceTest {
     private FlowServiceConfig config(Duration llmTimeout) {
         return new FlowServiceConfig(
                 "http://localhost:8081",
-                "http://localhost:11434",
+                "ollama",
                 "qwen2.5:7b",
                 5,
                 0,
